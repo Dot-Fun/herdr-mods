@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Opens another Herdr window: a second app process with its own home, on the same herdr-core session.
+src=~/.config/herdr-app
+n=2
+# A home is live when its app answers status within 3 seconds (macOS has no timeout command).
+while HERDR_APP_HOME=~/.config/herdr-app-$n perl -e 'alarm 3; exec @ARGV' herdr-app status >/dev/null 2>&1; do n=$((n+1)); done
+home=~/.config/herdr-app-$n
+[[ -d $home ]] || { mkdir -p $home; cp $src/shared.json $home/ 2>/dev/null; }
+mkdir -p $home/layouts $home/mods
+# shortcut: copies, not symlinks (live reload through symlinks is untested); edit only ~/.config/herdr-app, since each launch overwrites these.
+for f in keys.json settings.json programs.json; do [[ -f $src/$f ]] && rsync -a $src/$f $home/; done
+rsync -a $src/layouts/main-dnd.json $home/layouts/
+for m in prefix herdr-tui send-to-space tabs-dnd tab-drop pane-dnd; do rsync -a $src/mods/$m $home/mods/; done
+env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE open -n -a ~/Applications/Herdr.app --env HERDR_APP_HOME=$home

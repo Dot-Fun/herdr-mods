@@ -1,0 +1,18 @@
+Herdr Mods
+
+tabs-dnd and pane-dnd are modified copies of the tabs and pane mods that ship
+with the Herdr desktop app, version 0.1.16. Herdr is licensed under the Apache
+License, Version 2.0. Their icons (win-close.svg, win-max.svg, win-min.svg,
+win-restore.svg, close.svg, split-right.svg, split-down.svg, zoom.svg,
+unzoom.svg) are copies of the shipped icons.
+
+The layout tab-drag/layouts/main-dnd.json is a modified copy of the main
+layout that ships with Herdr 0.1.16.
+
+Changes:
+- tabs-dnd: drag a tab to reorder it with a drop line, drag a tab onto the
+  pane area to split, and make the focused pane a tab when a grip drag ends on
+  the tab bar. Icon paths point at mods/tabs-dnd/.
+- pane-dnd: drag a pane by its header to the tab bar to make it a tab. Icon
+  paths point at mods/pane-dnd/.
+- main-dnd.json: the tab bar uses tabs-dnd and the pane headers use pane-dnd.

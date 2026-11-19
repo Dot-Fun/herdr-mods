@@ -10,7 +10,7 @@ The entry has:
 
 - `mods/prefix`: the popup that reads the key after `ctrl-b`.
 - `mods/send-to-space`: the list that `ctrl-b m` opens.
-- `keys.json`: one binding, `"ctrl-b": "mod.open:prefix"` in the `global` section.
+- `keys.json`: the binding `"ctrl-b": "mod.open:prefix"` in the `global` section, and two optional close keys for macOS (see Close keys).
 - `bin/herdr-window`: the script that `ctrl-b w` runs.
 
 **Before you add it:** `prefix` runs `hc` (herdr-core) to press `ctrl-b` in a terminal and to set terminal labels. It runs `~/.local/bin/herdr-window` for `ctrl-b w`. `send-to-space` runs `hc` to set terminal labels. Neither mod uses the network. `herdr-window` reads and copies files from `~/.config/herdr-app` into a new app home.
@@ -83,6 +83,17 @@ Edit `~/.config/herdr-app` only. Each launch writes over the copies in the secon
 - `m` lists only spaces on the same machine as the pane.
 - `!` does nothing for a pane that is alone in its tab.
 - The popup shows only `prefix…`. It does not list the keys.
+
+## Close keys
+
+The entry's `keys.json` also swaps the two close keys on macOS. They are optional, and the mods work without them.
+
+| Key | Herdr default | With this entry |
+| --- | --- | --- |
+| `cmd-w` | Close the tab and every pane in it | Close the focused pane only |
+| `cmd-shift-w` | Close the focused pane | Close the tab |
+
+A split tab then loses one pane per `cmd-w`, not all of them. To use them, add `"cmd-w": "pane.close"` and `"cmd-shift-w": "tab.close"` to the `global` section of your `keys.json`.
 
 ## License
 

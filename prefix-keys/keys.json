@@ -1,5 +1,7 @@
 {
   "global": {
-    "ctrl-b": "mod.open:prefix"
+    "ctrl-b": "mod.open:prefix",
+    "cmd-w": "pane.close",
+    "cmd-shift-w": "tab.close"
   }
 }

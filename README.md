@@ -1,6 +1,6 @@
 # Herdr Mods
 
-Three mods for the [Herdr](https://herdr.dev) desktop app. Each folder is one entry in the Herdr mod gallery, laid out like an app home. Each has its own `README.md`, a `RECIPE.md` for an agent that builds or adds it, and a `preview.png`.
+Four mods for the [Herdr](https://herdr.dev) desktop app. Each folder is one entry in the Herdr mod gallery, laid out like an app home. Each has its own `README.md`, a `RECIPE.md` for an agent that builds or adds it, and a `preview.png`.
 
 To add one, ask your Herdr agent:
 
@@ -8,7 +8,7 @@ To add one, ask your Herdr agent:
 Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/Dot-Fun/herdr-mods/<entry>
 ```
 
-Put `tab-drag`, `tui-bridge` or `prefix-keys` in place of `<entry>`. Each entry works alone.
+Put `tab-drag`, `tui-bridge`, `prefix-keys` or `machine-switch` in place of `<entry>`. Each entry works alone.
 
 ## Tab Drag
 
@@ -34,6 +34,14 @@ A `ctrl-b` prefix, as in tmux. Press `ctrl-b`, then one key to split, move, zoom
 
 [Read more](prefix-keys/README.md)
 
+## Machine Switch
+
+A switch on each machine's row in the Spaces sidebar. Switch a machine off and its spaces fold away in this window. The machine stays in the list, drawn dim, and one click brings it back.
+
+![Machine Switch](machine-switch/preview.png)
+
+[Read more](machine-switch/README.md)
+
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE). `tabs-dnd` and `pane-dnd` are changed copies of mods that ship with Herdr. See [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](LICENSE). `tabs-dnd`, `pane-dnd` and `spaces-machines` are changed copies of mods that ship with Herdr. See [NOTICE](NOTICE).

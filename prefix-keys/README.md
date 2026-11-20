@@ -69,8 +69,8 @@ In the `ctrl-b m` list, press up and down (or `j` and `k`) to choose a space, En
 `herdr-window` opens one more Herdr window that shows the same terminals. It does this:
 
 1. It finds the first app home, `~/.config/herdr-app-2`, `-3` and so on, whose window does not answer `herdr-app status` within 3 seconds.
-2. It copies `keys.json`, `settings.json` and `programs.json` from `~/.config/herdr-app` into that home. It copies `shared.json` only when it makes the home.
-3. It copies the layout `main-dnd.json` and the mods `prefix`, `herdr-tui`, `send-to-space`, `tabs-dnd`, `tab-drop` and `pane-dnd`. Some of these come from the other entries in this repository. When one is missing, `rsync` prints an error and the script goes on.
+2. It copies `keys.json`, `settings.json`, `programs.json` and `shared.json` from `~/.config/herdr-app` into that home. `shared.json` holds the shown layout, so the new window starts with the same layout as the main one.
+3. It copies every layout and every mod. A mod or layout you add later reaches new windows with no change to the script.
 4. It starts the app with `open -n -a ~/Applications/Herdr.app` and the new `HERDR_APP_HOME`.
 
 Edit `~/.config/herdr-app` only. Each launch writes over the copies in the second home.

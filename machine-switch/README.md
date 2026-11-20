@@ -1,16 +1,16 @@
 # Machine Switch
 
-A switch on each machine's row in the Spaces sidebar of the [Herdr](https://herdr.dev) desktop app. Switch a machine off and its spaces fold away in this window. The machine stays in the list, drawn dim, and one click on the switch brings it back.
+A switch on each machine's row in the Spaces sidebar of the [Herdr](https://herdr.dev) desktop app. Switch a machine off and its spaces fold away. The machine stays in the list, drawn dim, and one click on the switch brings it back.
 
 ![Machine Switch: one machine off, two machines on](preview.png)
 
-The preview shows three example machines. `build-box` is off: its row is dim and its switch is grey. `gpu-server` and `staging` are on.
+The preview shows three example machines. `build-box` is off: its row is dim and the knob of its switch is grey and on the left. The knob of a machine that is on is green and on the right. `gpu-server` and `staging` are on.
 
-Use it when you have many machines and want one window to show only some of them. Nothing is disconnected. A machine that is off stays connected, and its terminals and agents keep running.
+Use it when you have many machines and want to see only some of them. Nothing is disconnected. A machine that is off stays connected, and its terminals and agents keep running.
 
 The entry has one mod, `mods/spaces-machines`. It is a changed copy of Herdr's `spaces` mod.
 
-**Before you add it:** the mod runs the same programs as Herdr's `spaces` mod: `hc` (herdr-core) to list machines, and `git` to read each space's branch. It does not use the network.
+**Before you add it:** the mod runs the same programs as Herdr's `spaces` mod: `hc` (herdr-core) to list machines, and `git` to read each space's branch. It also runs `sh` to write two small files in `~/.config/herdr-shared/`. It does not use the network.
 
 ## Add it
 
@@ -37,11 +37,17 @@ To add it by hand:
 
 "This computer" has no switch. It always shows.
 
-Each window keeps its own set of machines that are off. One window can show your own machines and a second window the rest.
+To change the order of the machines, drag a machine's row onto another machine's row. A line shows where the machine lands. Release outside the sidebar to cancel.
+
+## All windows stay the same
+
+Every Herdr window on one computer shows the same machines on and off, in the same order. Switch a machine in one window and the other windows follow in a few seconds.
+
+Each window has its own shared state, so the mod also keeps both lists in files: `~/.config/herdr-shared/machines-hidden.json` and `~/.config/herdr-shared/machines-order.json`. Each file holds a JSON array of machine names. You can edit a file by hand and the windows follow.
 
 ## Hide the machine's agents too
 
-The mod stores the names of the machines that are off in shared state, under the key `machines.hidden`. Any mod can read it. The sidebar's spaces list reads it. Herdr's `agents` mod does not, so agents on a machine that is off still show in the Agents list.
+The mod stores the names of the machines that are off in shared state, under the key `machines.hidden`, and their order under `machines.order`. Any mod can read them. The sidebar's spaces list reads it. Herdr's `agents` mod does not, so agents on a machine that is off still show in the Agents list.
 
 To hide them, clone the mod that lists your agents and filter its list. An agent on another machine has an address such as `build-box/t7`.
 

@@ -19,4 +19,7 @@ Changes:
 - main-dnd.json: the tab bar uses tabs-dnd and the pane headers use pane-dnd.
 - spaces-machines: each remote machine's header has an on/off switch. A machine
   that is off stays listed, drawn dim, without its spaces. The names of the
-  machines that are off live in shared state as "machines.hidden".
+  machines that are off live in shared state as "machines.hidden". A drag of a
+  machine header changes the order of the groups ("machines.order"). Both
+  values are also kept in files in ~/.config/herdr-shared/, so every window on
+  the computer shows the same.

@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, home, readTextFile, checking } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -53,6 +53,9 @@ async function both(a, b) {
 // that draws space avatars): one strong color per hue, light and dark alike.
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 
+// Shared keys that every Herdr window on this computer follows, each through one file in syncDir.
+const SYNCED = { "machines.hidden": "machines-hidden.json", "machines.order": "machines-order.json" };
+
 // A space speaks up only when something in it needs you.
 export function glyph(status) {
   return status === "blocked" || status === "done" ? "●" : "·";
@@ -89,6 +92,17 @@ export default class Spaces extends View {
     try { this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]")); } catch { this.folded = new Set(); }
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
+    // Every Herdr window on this computer has its own shared state, so the machines switched off
+    // also live in one file that all windows follow.
+    this.syncDir = `${home()}/.config/herdr-shared`;
+    if (!checking()) cx.spawn(async (cx) => {
+      await this.pull(true);
+      for (;;) {
+        try { await watchFolder(this.syncDir); } catch { await cx.sleep(15000); }
+        await cx.sleep(200);
+        await this.pull();
+      }
+    });
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
   }
@@ -152,8 +166,58 @@ export default class Spaces extends View {
     return [key, ...(repo ? [...keys].filter((k) => this.git[k]?.repo === repo) : [])];
   }
 
+  // Each file's list becomes this window's shared key. seed: a missing file is made from this window's list.
+  async pull(seed) {
+    for (const [key, file] of Object.entries(SYNCED)) {
+      if (this.pushing) return;
+      const text = await readTextFile(`${this.syncDir}/${file}`).catch(() => null);
+      if (text == null) { if (seed) await this.push(key, shared(key) ?? []); continue; }
+      let list;
+      try { list = JSON.parse(text); } catch { continue; }
+      if (Array.isArray(list) && JSON.stringify(list) !== JSON.stringify(shared(key) ?? [])) setShared(key, list);
+    }
+  }
+
+  // Written through a temp file and mv, so another window never reads half a list.
+  async push(key, list) {
+    this.pushing = true;
+    try {
+      await exec("sh", ["-c", 'mkdir -p "$1" && printf %s "$2" > "$1/.tmp.$$" && mv "$1/.tmp.$$" "$1/$3"', "sh", this.syncDir, JSON.stringify(list), SYNCED[key]]);
+    } catch {}
+    this.pushing = false;
+  }
+
+  // Drag a machine's header onto another to move its group there (shared "machines.order").
+  // `names`: the groups in their shown order, null for this computer.
+  draggable(el, m, names, t) {
+    const drag = this.machineDrag;
+    const from = drag ? names.indexOf(drag.from) : -1, at = names.indexOf(m);
+    return el.relative()
+      .when(drag?.from === m && drag.over !== m, (el) => el.opacity(0.5))
+      .when(Boolean(drag) && drag.over === m && drag.from !== m, (el) => el.child(
+        div().absolute().left(0).right(0).h(2).bg(t.accent)
+          .when(from < at, (line) => line.bottom(0))
+          .when(from > at, (line) => line.top(0))))
+      .on_mouse_down("left", () => { this.machineDrag = { from: m, over: m }; })
+      .on_mouse_move((_e, cx) => {
+        if (this.machineDrag && this.machineDrag.over !== m) { this.machineDrag.over = m; cx.notify(); }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        const src = this.machineDrag?.from;
+        this.machineDrag = null;
+        if (src === undefined || src === m) return;
+        const next = names.filter((n) => n !== src);
+        // Dragged down: lands below the target; up: above it, where the line showed.
+        next.splice(next.indexOf(m) + (from < at ? 1 : 0), 0, src);
+        setShared("machines.order", next);
+        this.push("machines.order", next);
+        cx.notify();
+      });
+  }
+
   refreshMachines(cx) {
     cx.spawn(async cx => {
+      if (!checking()) await this.pull();
       try { const r = await hc(["machine", "ls", "--json"]); if (r.code === 0) this.machines = (JSON.parse(r.stdout).machines ?? []).filter((m) => !m.temporary); } catch {}
       cx.notify();
     });
@@ -339,7 +403,11 @@ export default class Spaces extends View {
   grouped(t, collapsed) {
     // Machines switched off with the header switch (shared "machines.hidden"): listed, drawn disabled, without spaces.
     const off = shared("machines.hidden") ?? [];
-    const flip = (m) => setShared("machines.hidden", off.includes(m) ? off.filter(n => n !== m) : [...off, m]);
+    const flip = (m) => {
+      const next = off.includes(m) ? off.filter(n => n !== m) : [...off, m];
+      setShared("machines.hidden", next);
+      this.push("machines.hidden", next);
+    };
     const rows = this.ordered().filter(r => !off.includes(r.w.machine));
     const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
     // Where the active space's row lands among the children this returns: the list scrolls by its direct
@@ -358,7 +426,10 @@ export default class Spaces extends View {
       this.activeAt = rows.findIndex(r => r.w.active);
       return rows.map(draw);
     }
-    const machineNames = [null, ...remote];
+    // Dragged order first ("machines.order"); machines it doesn't list keep their default place after them.
+    const order = shared("machines.order") ?? [];
+    const all = [null, ...remote];
+    const machineNames = [...order.filter((m) => all.includes(m)), ...all.filter((m) => !order.includes(m))];
     return machineNames.flatMap((m) => {
       const mine = rows.filter((r) => (r.w.machine ?? null) === m);
       const repair = this.reconnecting[m];
@@ -369,16 +440,16 @@ export default class Spaces extends View {
       const isOff = off.includes(m);
       const folded = this.folded.has(m);
       const toggle = div().id(`machine-switch-${m}`).flex_none().w(22).h(12).rounded(6).relative().cursor_pointer()
-        .bg(isOff ? t.border : t.ansi2).tooltip(isOff ? `Show ${m}` : `Hide ${m} in this window`)
+        .bg(t.border).tooltip(isOff ? `Show ${m}` : `Hide ${m}`)
         .on_click((_e, cx) => { cx.stop_propagation(); flip(m); })
-        .child(div().absolute().top(2).left(isOff ? 2 : 12).size(8).rounded(4).bg(isOff ? t.dim : t.chrome));
+        .child(div().absolute().top(2).left(isOff ? 2 : 12).size(8).rounded(4).bg(isOff ? t.dim : t.ansi2));
       if (isOff) {
         before += 1;
         const dimIcon = svg(`mods/workspace-chrome/server.svg`).size(13).flex_none().opacity(0.45);
         return [collapsed
           ? railCell(h_flex().id(`machine-${m}`).h(26).mt(4).w(RAIL_CELL).flex_none().justify_center().items_center().rounded(6)
               .text_color(t.dim).tooltip(`${m} · hidden. Right-click to show.`).on_mouse_down("right", () => flip(m)).child(dimIcon))
-          : h_flex().id(`machine-${m}`).h(26).flex_none().px(8).gap(7).items_center().text_size(11).text_color(t.dim)
+          : this.draggable(h_flex().id(`machine-${m}`).h(26).flex_none().px(8).gap(7).items_center().text_size(11).text_color(t.dim), m, machineNames, t)
               .child(dimIcon).child(div().flex_1().truncate().opacity(0.45).child(m)).child(toggle).child(div().w(33).flex_none())]; // spacer: the width of the + and the chevron, so switches line up
       }
       const icon = svg(`mods/workspace-chrome/${m ? "server" : "monitor"}.svg`).size(13).flex_none();
@@ -386,6 +457,7 @@ export default class Spaces extends View {
       const head = h_flex().id(`machine-${m ?? "local"}`).h(26).flex_none().px(collapsed ? 0 : 8).gap(7).items_center().text_size(11).text_color(t.dim)
         .when(collapsed, el => el.mt(4).w(RAIL_CELL).justify_center().rounded(6).tooltip(login ? `${m} needs a login: run ${login}. Click for Copy.` : m ? `${m} · ${connected ? "connected" : (machine?.state ?? "asleep").replace(/_/g, " ")}` : "This computer"))
         .cursor_pointer().hover(s => s.bg(t.hover))
+        .when(!collapsed, el => this.draggable(el, m, machineNames, t))
         .when(Boolean(m) && collapsed, el => el.on_mouse_down("right", () => flip(m)))
         .on_click((_e, cx) => {
           if (isOff) return;
@@ -534,6 +606,14 @@ export default class Spaces extends View {
       .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));
   }
 
+  cancelDrag(cx) {
+    if (this.pressed === null && this.over === null && !this.machineDrag) return;
+    this.pressed = null;
+    this.over = null;
+    this.machineDrag = null;
+    cx.notify();
+  }
+
   render() {
     const t = theme();
     const collapsed = narrow();
@@ -557,7 +637,10 @@ export default class Spaces extends View {
       this.revealedAt = this.activeAt;
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
-    return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
+    return v_flex().id("spaces-root").size_full().min_h(0).bg(t.chrome).text_size(13)
+      // A release anywhere in this block, or the pointer leaving it, ends a drag. Without this the drop line stays.
+      .on_mouse_up("left", (_e, cx) => this.cancelDrag(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.cancelDrag(cx); })
       .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child("Spaces"))
@@ -566,7 +649,6 @@ export default class Spaces extends View {
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
         .children(list));
   }
 }

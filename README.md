@@ -36,7 +36,7 @@ A `ctrl-b` prefix, as in tmux. Press `ctrl-b`, then one key to split, move, zoom
 
 ## Machine Switch
 
-A switch on each machine's row in the Spaces sidebar. Switch a machine off and its spaces fold away in this window. The machine stays in the list, drawn dim, and one click brings it back.
+A switch on each machine's row in the Spaces sidebar. Switch a machine off and its spaces fold away. The machine stays in the list, drawn dim, and one click brings it back. Drag a machine to change the order. Every Herdr window on the computer follows.
 
 ![Machine Switch](machine-switch/preview.png)
 

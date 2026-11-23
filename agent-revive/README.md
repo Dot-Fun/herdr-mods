@@ -39,7 +39,7 @@ To add it by hand:
 
 ## Use it
 
-There is nothing to do. Once a minute the mod saves the agents that run now. After a reboot, open Herdr. Within about a minute, each saved terminal that is back at its shell gets its resume command.
+There is nothing to do. Once a minute the mod saves the agents that run now. A save costs less than one second of processor time. After a reboot, open Herdr, or add Herdr to your login items so that it opens by itself. Within about a minute, each saved terminal that is back at its shell gets its resume command.
 
 Click the text to save at once, for example right before a reboot.
 
@@ -55,7 +55,7 @@ To run it by hand:
 - An agent resumes at its last saved message. An agent that was in the middle of a turn does not continue the turn by itself.
 - An agent in a folder that Claude Code does not trust for good, such as the home folder, stops at the trust question. Answer it once.
 - A terminal that runs something else when the restore comes is left alone. The mod never types into a program.
-- An agent you quit before the reboot is not resumed. It leaves the saved list within a minute.
+- An agent you quit leaves the saved list after 5 minutes. The wait is there because a shutdown stops the agents one by one, and those must stay saved. An agent you quit less than 5 minutes before a reboot resumes too.
 - A power cut can lose the agents started in the last minute.
 - Programs that are not agents, such as a `tail` or a dev server, are not restarted.
 - Terminals on other machines are not saved. Those machines do not reboot with this one.

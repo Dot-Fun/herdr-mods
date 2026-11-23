@@ -17,11 +17,11 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 
 - **At start and every 60 seconds** the view runs `hc-revive tick`, then reads the two state files to refresh its text.
 - **A click on the text** runs `hc-revive save`.
-- **`save`** lists the live, kept terminals of this computer (`hc ls --json`, `hc get`). For each, it takes the tty of the terminal's root process and looks for an agent on that tty:
+- **`save`** lists the live, kept terminals of this computer (`hc ls --json`, `hc get`). One `ps -axo pid=,tty=,comm=` call gives the tty of each terminal's root process and the processes on it. One `lsof` call for all `codex` and `agy` processes gives their open files. For each terminal, it looks for an agent on the tty:
   - Claude Code: a file `~/.claude/sessions/<pid>.json` whose process is on the tty. The command is `claude --resume <sessionId>` and the folder is the file's `cwd`.
   - Codex: a `codex` process on the tty that holds a `rollout-*.jsonl` file open. The first line of the file gives `payload.session_id` and `payload.cwd`. The command is `codex resume <session_id>`.
   - Antigravity: an `agy` process on the tty that holds `antigravity-cli/brain/<id>` open. The command is `agy --conversation <id>`, in the process's working folder.
-  It writes `~/.local/state/hc-revive/snapshot.json`: `{boot, terminals: [{address, cwd, cmd}]}`. `boot` is the boot time in seconds.
+  It writes `~/.local/state/hc-revive/snapshot.json`: `{boot, terminals: [{address, cwd, cmd, seen}]}`. `boot` is the boot time in seconds and `seen` is the time of the last save that found the agent. A terminal that was in the last snapshot and has no agent now stays in the snapshot until its `seen` is 5 minutes old.
 - **`restore [file]`** goes through the saved terminals. For a terminal that is live and whose foreground process is its own root shell, it runs `hc send <address> "cd <cwd> && <cmd>"` and waits 100 ms. It leaves every other terminal alone and reports it.
 - **`tick`**:
   1. Stops when the core does not answer `hc server status`.
@@ -46,6 +46,8 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - The open Codex rollout files are often sub-agent threads. `payload.session_id` names the root session. `payload.id` does not.
 - A Claude session resumes only from its own folder. Type `cd <cwd> &&` before the command.
 - Compare the foreground process ID with the terminal's root process ID before any `hc send`. A send into a running agent would become a prompt.
+- A shutdown stops the agents one by one while the mod can still run. Without the 5 minute rule, a save in that moment drops the agents that are already gone, and they never resume.
+- On macOS each `ps` call costs about a third of a second, however few processes it names. Call `ps` once for a save, not once for each terminal. The same goes for `lsof` and `jq`.
 - Right after a reboot the terminals are shells, so a save would find no agents. Do the boot check before the save, and never replace a snapshot with an empty one.
 - The core can bring a terminal back a little late. Keep the terminals that were not ready in `pending.json` and try again on the next ticks.
 - `sysctl -n kern.boottime` prints `{ sec = …, usec = … }`. Match `sec` at the start of the line, or the pattern takes `usec`.
@@ -58,5 +60,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - `herdr-app check mods/agent-revive` passes and `herdr-app status` shows `errors: []`.
 - `hc-revive save` prints one line for each local agent terminal, and a Codex ID is a root session.
 - A kept terminal that runs Claude, killed with `kill -9` on its root process, comes back as a shell. `hc-revive restore` then resumes the same session, and a second restore reports the terminal as busy.
+- With two entries added to the snapshot by hand, one with `seen` 100 seconds old and one 400 seconds old, the next `save` keeps the first and drops the second.
+- `time hc-revive save` shows less than one second of processor time for 25 agents.
 - With `boot` in the snapshot changed to an old value, `tick` writes `pending.json`, types nothing into running agents, and saves again after the pending file is gone.
 - The status bar shows the count of saved agents.

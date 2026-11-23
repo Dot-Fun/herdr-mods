@@ -14,48 +14,63 @@ uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
 # One local live kept terminal per line: address, root pid.
 terminals() {
-  hc ls --json | jq -r '.terminals[].address | select(contains("/") | not)' | while read -r t; do
-    hc get $t --json | jq -r 'select(.state == "live" and .keep) | [.address, .pid] | @tsv'
-  done
+  hc ls --json | jq -r '.terminals[].address | select(contains("/") | not)' | while read -r t; do hc get $t --json; done |
+    jq -r 'select(.state == "live" and .keep) | [.address, .pid] | @tsv'
 }
 
-# The command that resumes the agent on a tty, as JSON {cwd, cmd}; nothing when no known agent runs there.
-resume() {
-  local tty=$1 pid comm f id
-  # Claude writes one file per live process.
-  for f in ~/.claude/sessions/*.json(N); do
-    pid=${f:t:r}
-    [[ $(ps -o tty= -p $pid 2>/dev/null | tr -d ' ') == $tty ]] || continue
-    jq -c '{cwd, cmd: "claude --resume \(.sessionId)"}' $f
-    return
+# One line (address, folder, resume command) for each terminal that runs a known agent.
+# One ps and one lsof do the work.
+agents() {
+  local t pid tty comm kind val f tab=$'\t'
+  typeset -A root tty_of addr_of cwd_of entry
+  local -a others
+  terminals | while IFS=$'\t' read -r t pid; do root[$t]=$pid; done
+  (( $#root )) || return 0
+  # One ps for everything: each ps call costs a third of a second here, however few processes it names.
+  ps -axo pid=,tty=,comm= | while read -r pid tty comm; do
+    [[ $tty == '??' ]] && continue
+    tty_of[$pid]=$tty
+    [[ ${comm:t} == (codex|agy)* ]] && others+=($pid)
   done
-  ps -t $tty -o pid=,comm= | while read -r pid comm; do
-    case ${comm:t} in
-      codex*)
-        # The open rollouts are often sub-agent threads; session_id names the root.
-        f=$(lsof -p $pid -Fn 2>/dev/null | sed -n 's/^n//p' | grep -m1 '/rollout-.*\.jsonl$') || continue
-        head -1 $f | jq -c '{cwd: .payload.cwd, cmd: "codex resume \(.payload.session_id)"}'
-        return ;;
-      agy*)
-        id=$(lsof -p $pid -Fn 2>/dev/null | grep -oE "antigravity-cli/brain/$uuid" | head -1) || continue
-        [[ -n $id ]] || continue
-        jq -nc --arg cwd "$(lsof -a -p $pid -d cwd -Fn | sed -n 's/^n//p')" --arg id ${id:t} '{cwd: $cwd, cmd: "agy --conversation \($id)"}'
-        return ;;
-    esac
+  for t pid in ${(kv)root}; do [[ -n ${tty_of[$pid]:-} ]] && addr_of[${tty_of[$pid]}]=$t; done
+  (( $#addr_of )) || return 0
+  # Codex holds its rollout files open, and agy its conversation folder. The open rollouts are often
+  # sub-agent threads; session_id in the first line names the root.
+  (( $#others )) && lsof -a -p ${(j:,:)others} -d cwd,0-9999 -Fpfn 2>/dev/null | awk '
+    /^p/ { pid = substr($0, 2) } /^f/ { fd = substr($0, 2) }
+    /^n/ { n = substr($0, 2)
+      if (fd == "cwd") print pid "\tcwd\t" n
+      else if (n ~ /\/rollout-.*\.jsonl$/) print pid "\tcodex\t" n
+      else if (match(n, /antigravity-cli\/brain\/[0-9a-f-]+/)) print pid "\tagy\t" substr(n, RSTART + 22, RLENGTH - 22) }' |
+  while IFS=$'\t' read -r pid kind val; do
+    t=${addr_of[${tty_of[$pid]}]:-}
+    [[ -n $t ]] || continue
+    [[ $kind == cwd ]] && { cwd_of[$pid]=$val; continue; }
+    [[ -n ${entry[$t]:-} ]] && continue
+    [[ $kind == codex ]] && entry[$t]=$(head -1 $val | jq -r '[.payload.cwd, "codex resume \(.payload.session_id)"] | @tsv')
+    [[ $kind == agy ]] && entry[$t]="${cwd_of[$pid]}${tab}agy --conversation $val"
   done
+  # Claude writes one file per live process, and wins over a codex or agy that it started.
+  local -a files=(~/.claude/sessions/*.json(N))
+  (( $#files )) && jq -r '[input_filename, .cwd, "claude --resume \(.sessionId)"] | @tsv' $files |
+  while IFS=$'\t' read -r f val kind; do
+    t=${addr_of[${tty_of[${f:t:r}]:-none}]:-}
+    [[ -n $t ]] && entry[$t]="$val$tab$kind"
+  done
+  for t in ${(k)entry}; do [[ -n ${entry[$t]} ]] && print -r -- "$t$tab${entry[$t]}"; done
 }
 
 save() {
-  local out=$state/.snapshot.$$ n=0
-  local entries=$(terminals | while IFS=$'\t' read -r t pid; do
-    tty=$(ps -o tty= -p $pid 2>/dev/null | tr -d ' ')
-    [[ -n $tty && $tty != '??' ]] || continue
-    r=$(resume $tty)
-    [[ -n $r ]] && jq -c --arg t $t '{address: $t} + .' <<<$r
-  done)
+  local out=$state/.snapshot.$$
+  local entries=$(agents)
   # An empty list right after a reboot must not replace the snapshot that restore still needs.
   [[ -n $entries ]] || { echo "no agent terminals found; snapshot left as it was"; return 0; }
-  jq -s --argjson boot $(boot) '{boot: $boot, terminals: .}' <<<$entries > $out && mv $out $snap
+  [[ -f $snap ]] || echo '{"terminals": []}' > $snap
+  # A shutdown stops the agents one by one, so an agent that is gone stays saved for 5 minutes.
+  jq -Rs --argjson boot $(boot) --argjson now $(date +%s) --slurpfile old $snap '
+    [split("\n")[] | select(length > 0) | split("\t") | {address: .[0], cwd: .[1], cmd: .[2], seen: $now}] as $new
+    | {boot: $boot, terminals: ($new + [$old[0].terminals[]
+        | select((.seen // 0) > $now - 300 and (.address as $a | $new | all(.address != $a)))])}' <<<$entries > $out && mv $out $snap
   jq -r '.terminals[] | [.address, .cmd, .cwd] | @tsv' $snap
 }
 

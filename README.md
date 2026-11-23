@@ -1,6 +1,6 @@
 # Herdr Mods
 
-Four mods for the [Herdr](https://herdr.dev) desktop app. Each folder is one entry in the Herdr mod gallery, laid out like an app home. Each has its own `README.md`, a `RECIPE.md` for an agent that builds or adds it, and a `preview.png`.
+Five mods for the [Herdr](https://herdr.dev) desktop app. Each folder is one entry in the Herdr mod gallery, laid out like an app home. Each has its own `README.md`, a `RECIPE.md` for an agent that builds or adds it, and a `preview.png`.
 
 To add one, ask your Herdr agent:
 
@@ -8,7 +8,7 @@ To add one, ask your Herdr agent:
 Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/Dot-Fun/herdr-mods/<entry>
 ```
 
-Put `tab-drag`, `tui-bridge`, `prefix-keys` or `machine-switch` in place of `<entry>`. Each entry works alone.
+Put `tab-drag`, `tui-bridge`, `prefix-keys`, `machine-switch` or `agent-revive` in place of `<entry>`. Each entry works alone.
 
 ## Tab Drag
 
@@ -41,6 +41,14 @@ A switch on each machine's row in the Spaces sidebar. Switch a machine off and i
 ![Machine Switch](machine-switch/preview.png)
 
 [Read more](machine-switch/README.md)
+
+## Agent Revive
+
+Agents that start again after a reboot. The desktop app gives a terminal lost to a reboot an empty shell. This mod saves the command that resumes each Claude Code, Codex and Antigravity agent, and types it into the shell that comes back. macOS only.
+
+![Agent Revive](agent-revive/preview.png)
+
+[Read more](agent-revive/README.md)
 
 ## License
 

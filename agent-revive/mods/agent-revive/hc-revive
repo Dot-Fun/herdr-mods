@@ -1,0 +1,96 @@
+#!/bin/zsh
+# Resume agents in Herdr desktop (herdr-core) terminals after a reboot. The core only gives a lost terminal a shell.
+# hc-revive save            write the snapshot: each local agent terminal and the command that resumes it
+# hc-revive restore [file]  type the resume command into each saved terminal that is back at its shell
+# hc-revive tick            for the mod's timer: restore once after a reboot, then save
+set -u
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+state=${HC_REVIVE_STATE:-~/.local/state/hc-revive}
+snap=$state/snapshot.json
+pending=$state/pending.json
+mkdir -p $state
+boot() { sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+).*/\1/'; }
+uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+# One local live kept terminal per line: address, root pid.
+terminals() {
+  hc ls --json | jq -r '.terminals[].address | select(contains("/") | not)' | while read -r t; do
+    hc get $t --json | jq -r 'select(.state == "live" and .keep) | [.address, .pid] | @tsv'
+  done
+}
+
+# The command that resumes the agent on a tty, as JSON {cwd, cmd}; nothing when no known agent runs there.
+resume() {
+  local tty=$1 pid comm f id
+  # Claude writes one file per live process.
+  for f in ~/.claude/sessions/*.json(N); do
+    pid=${f:t:r}
+    [[ $(ps -o tty= -p $pid 2>/dev/null | tr -d ' ') == $tty ]] || continue
+    jq -c '{cwd, cmd: "claude --resume \(.sessionId)"}' $f
+    return
+  done
+  ps -t $tty -o pid=,comm= | while read -r pid comm; do
+    case ${comm:t} in
+      codex*)
+        # The open rollouts are often sub-agent threads; session_id names the root.
+        f=$(lsof -p $pid -Fn 2>/dev/null | sed -n 's/^n//p' | grep -m1 '/rollout-.*\.jsonl$') || continue
+        head -1 $f | jq -c '{cwd: .payload.cwd, cmd: "codex resume \(.payload.session_id)"}'
+        return ;;
+      agy*)
+        id=$(lsof -p $pid -Fn 2>/dev/null | grep -oE "antigravity-cli/brain/$uuid" | head -1) || continue
+        [[ -n $id ]] || continue
+        jq -nc --arg cwd "$(lsof -a -p $pid -d cwd -Fn | sed -n 's/^n//p')" --arg id ${id:t} '{cwd: $cwd, cmd: "agy --conversation \($id)"}'
+        return ;;
+    esac
+  done
+}
+
+save() {
+  local out=$state/.snapshot.$$ n=0
+  local entries=$(terminals | while IFS=$'\t' read -r t pid; do
+    tty=$(ps -o tty= -p $pid 2>/dev/null | tr -d ' ')
+    [[ -n $tty && $tty != '??' ]] || continue
+    r=$(resume $tty)
+    [[ -n $r ]] && jq -c --arg t $t '{address: $t} + .' <<<$r
+  done)
+  # An empty list right after a reboot must not replace the snapshot that restore still needs.
+  [[ -n $entries ]] || { echo "no agent terminals found; snapshot left as it was"; return 0; }
+  jq -s --argjson boot $(boot) '{boot: $boot, terminals: .}' <<<$entries > $out && mv $out $snap
+  jq -r '.terminals[] | [.address, .cmd, .cwd] | @tsv' $snap
+}
+
+# Prints the entries it could not revive yet (still pending), as JSON lines.
+restore() {
+  local file=${1:-$snap}
+  jq -c '.terminals[]' $file | while read -r e; do
+    t=$(jq -r .address <<<$e)
+    info=$(hc get $t --json 2>/dev/null)
+    if [[ $(jq -r '.state == "live" and (.foreground == null or .foreground.pid == .pid)' <<<$info 2>/dev/null) == true ]]; then
+      hc send $t "$(jq -r '"cd \(.cwd | @sh) && \(.cmd)"' <<<$e)" >/dev/null && { echo "revived $t" >&2; sleep 0.1; continue; }
+    fi
+    [[ $(jq -r '.state // "gone"' <<<$info 2>/dev/null) == live ]] && echo "skip $t: busy" >&2 || echo "skip $t: not live" >&2
+    echo $e
+  done
+}
+
+case "${1:-}" in
+save) save ;;
+restore) restore ${2:-} >/dev/null ;;
+tick)
+  hc server status --json >/dev/null 2>&1 || exit 0
+  # Every Herdr window runs this mod: one tick at a time, and one save a minute between them.
+  find $state/lock -maxdepth 0 -mmin +5 -exec rmdir {} \; 2>/dev/null
+  mkdir $state/lock 2>/dev/null || exit 0
+  trap 'rmdir $state/lock' EXIT
+  now=$(boot)
+  [[ -f $snap && ! -f $pending && $(jq .boot $snap) == $now && $(( $(date +%s) - $(stat -f %m $snap) )) -lt 45 ]] && exit 0
+  [[ -f $snap && ! -f $pending && $(jq .boot $snap) != $now ]] && jq '. + {tries: 0}' $snap > $pending
+  if [[ -f $pending ]]; then
+    tries=$(jq .tries $pending)
+    left=$(restore $pending | jq -s --argjson n $((tries + 1)) '{tries: $n, terminals: .}')
+    # A terminal the core recovers late gets another try; one the user reused stays skipped.
+    if [[ $(jq '.terminals | length' <<<$left) == 0 || $tries -ge 9 ]]; then rm $pending; else echo $left > $pending; exit 0; fi
+  fi
+  save >/dev/null ;;
+*) sed -n 3,5p $0; exit 2 ;;
+esac

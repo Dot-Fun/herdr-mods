@@ -17,7 +17,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 
 ## How it behaves
 
-- **At start and every 60 seconds** the view runs `hc-revive tick`, then reads the two state files to refresh its text. Its execution budget is 120 seconds plus 12 seconds for every saved and pending row and 60 seconds for each distinct recorded core. This conservatively covers normal probe, restore, rescan, and alias-fallback work, but an unusually deep alias list or slower external command can still exceed the estimate.
+- **At start and every 60 seconds** the view requests a local worker and refreshes its counts from the published state. The worker acknowledges startup after acquiring the shared lock, then closes its launch pipes before running any Herdr command. It can finish a large recovery independently of the UI's ten-minute exec limit. Another window receives a busy response while that worker owns the lock. Failed startup is visible in the view.
 - **A click on the text** runs `hc-revive save`.
 - **`save`** lists live, kept local terminals (`hc ls --json`, `hc get`). One `ps -axo pid=,tty=,comm=` call gives the tty of each terminal's root process and the processes on it. One `lsof` call for all `codex` and `agy` processes gives their open files. For each terminal, it looks for an agent on the tty:
   - Claude Code: a file `~/.claude/sessions/<pid>.json` whose process is on the tty. The command is `claude --resume <sessionId>` and the folder is the file's `cwd`.
@@ -25,14 +25,14 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
   - Antigravity: an `agy` process on the tty that holds `antigravity-cli/brain/<id>` open. The command is `agy --conversation <id>`, in the process's working folder.
   For remote discovery it validates `hc machine ls --json`, deduplicates configured aliases by permanent core ID, and pipes this same script to one usable alias with `hc exec -i --on <alias> zsh -s -- remote-scan`. The reached core verifies `hc server status --json .id` and returns that ID with its Linux boot identity from `/proc/sys/kernel/random/boot_id`. A mismatched, failed, or malformed scan fails only that core.
   It writes `~/.local/state/hc-revive/snapshot.json` as `{version: 2, boot, machines, terminals}`. `machines` maps permanent core IDs to last observed Linux boot IDs. Each terminal stores `{machine, terminal, cwd, agent, session, seen}`; `machine` is null for the controller. Aliases and shell commands are not persisted in v2. A terminal missing from a successful scan ages out after 5 minutes, but an unavailable core's entries never age. An empty local scan preserves old local entries even when a remote scan succeeds.
-- **`restore [file]`** preserves local behavior: it requires an exact valid `hc get --json` response for the terminal, `state: live`, `keep: true`, a positive integer root PID, and either no foreground process or that same PID. Remote recovery is performed from `pending.json` by `tick`. The controller first atomically writes and syncs an `attempting` marker, then runs one `hc exec` helper on the current alias. Inside that same helper, the reached core proves its permanent ID, checks the bare local `tN`, rebuilds the allowlisted command, and calls its local `hc send`. Raw persisted command text is never trusted or evaluated. Busy terminals consume one of 10 available retries; unavailable terminals do not. A failed send or ambiguous outer transport becomes inert `delivery_unknown` evidence and is never retried automatically.
+- **`restore [file]`** selects eligible local rows from the supplied snapshot and uses the same pending journal as automatic recovery. An explicit pending file resumes queued work. Before every dispatch the controller renames and syncs an attempt marker. Local and remote recovery both require a live kept terminal at its root shell and rebuild the allowlisted command. The remote helper also verifies the permanent core ID. Each confirmed send removes that row immediately, and an uncertain result retains its marker for manual review.
 - **`tick`**:
-  1. Stops when the core does not answer `hc server status`.
-  2. Takes the same persistent `mutation.lock` fcntl lock used by top-level `save` and `restore`, so that several windows and manual commands cannot mutate or send from the same state concurrently. The kernel releases the lock when its zsh exits; file age is never used to reap a live owner.
+  1. Acquires the same persistent kernel lock as save and restore. Contention skips the scheduled run. Process exit releases the lock.
+  2. Checks whether the controller's Herdr core answers `hc server status`.
   3. Stops when the snapshot is from this boot and less than 45 seconds old.
   4. Probes each available core boot ID. First observation records a baseline only. A changed boot selects only that core's saved entries.
   5. Merges selected entries into `pending.json` with an atomic mode-0600 rename, calls `sync`, advances and syncs the snapshot baseline, and only then clears the deferred baseline. Applying an uncleared baseline again is idempotent.
-  6. Restores pending entries independently. Every remote dispatch has its own atomic rename and `sync` first. Explicitly successful entries leave the file, busy entries retry up to 10 available checks, unavailable entries remain unchanged, and delivery-ambiguous entries become inert for manual reconciliation. A malformed or unmigratable pending file is never erased.
+  6. Checkpoints each local or remote result independently. Explicit success removes the row, busy retries up to ten available checks, and unavailable terminals retain their retry budget. An ambiguous attempt remains inert for manual reconciliation.
   7. Saves.
 
 ## Built from
@@ -41,7 +41,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - **`mods/agent-revive/hc-revive`**: a zsh script with `save`, `restore` and `tick`. `HC_REVIVE_STATE` overrides the state folder, for tests.
 - **Layout**: the `status` block sits in a row with an `agent-revive` block of 190px.
 - **herdr functions**: `exec`, `appHome`, `home`, `readTextFile`, `theme`, `checking`.
-- **Controller programs**: zsh 5.9 with `zsh/system`, `hc`, `jq`, `ps`, `lsof`, `sync`, `sysctl`, and BSD `stat`.
+- **Controller programs**: zsh 5.9 with `zsh/system` and `zsh/files`, `hc`, `jq`, `ps`, `lsof`, `sync`, `sysctl`, and BSD `stat`.
 - **Remote programs/data**: `zsh`, `hc`, `jq`, `ps`, `lsof`, and `/proc/sys/kernel/random/boot_id`, in the default remote Herdr session.
 
 ## Watch out
@@ -62,10 +62,10 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - Validate exact JSON documents from remote scans and terminal inspection. Log prefixes, partial arrays, or malformed fields make the core unavailable; they must never look like an empty successful scan.
 - Reject all ASCII control characters in working directories. `@sh` quotes shell syntax, but it does not neutralize terminal-editing bytes such as Ctrl-U.
 - Existing local v1 `{address,cwd,cmd,seen}` rows migrate only when `address` is a bare `tN` and the command is an exact supported resume form with a UUID. Legacy remote `alias/tN` rows never inherit the core currently using that mutable alias; they and all other unresolved or unsafe records remain inert evidence.
-- Remote dispatches have a durable attempt marker before send. Local restore keeps the original behavior and has no such precommit, so controller death after a successful local send but before cleanup can replay that local command.
+- Every dispatch has a synced attempt marker. Inspect and reconcile interrupted attempts before clearing them. This applies to manual restore as well as automatic reboot recovery.
 - `sysctl -n kern.boottime` prints `{ sec = …, usec = … }`. Match `sec` at the start of the line, or the pattern takes `usec`.
 - Every Herdr window runs its own copy of the mod. Top-level `save`, `restore`, and `tick` cooperate on one persistent fcntl lock; its descriptor is not inherited by executed children and process exit releases it. Without that lock and the 45 second rule, two windows could type the same command twice.
-- A pending file may contain at most one actionable row for a stable `(machine, terminal)` identity. Migration marks collisions inert; an already-v2 collision fails the whole pending batch closed for manual reconciliation.
+- A snapshot or pending file can have at most one actionable row per stable `(machine, terminal)`. Every colliding row remains as inert evidence while independent entries can proceed.
 - Atomic rename plus `sync` provides the required pending-before-snapshot and snapshot-before-clear ordering for a controlled reboot. It is not a formal macOS sudden-power-loss guarantee equivalent to `F_FULLFSYNC`.
 - Do not start the script from `init` during `herdr-app check`. Test `checking()` first.
 - A view only runs while a layout shows its block. `"place": "none"` alone never starts it.

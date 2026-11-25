@@ -10,7 +10,7 @@ It resumes Claude Code (`claude --resume <id>`), Codex (`codex resume <id>`) and
 
 The entry has one mod, `mods/agent-revive`: a small view, `main.js`, and a zsh script, `hc-revive`, that does the work.
 
-**Before you add it:** the controller needs zsh 5.9 with its `zsh/system` module, `hc` (herdr-core), `ps`, `lsof`, `jq`, `sync`, `sysctl` and BSD `stat`. Each remote Linux core needs `zsh`, `hc`, `ps`, `lsof`, `jq`, and `/proc/sys/kernel/random/boot_id`. The script reads `~/.claude/sessions/` and the first line of open Codex session files to find session IDs. It writes mode-0600 state in `~/.local/state/hc-revive/` on the controller only. It uses existing Herdr machine connections through `hc exec`; recovery happens inside one remote helper that verifies the reached core's permanent ID before using that core's local `hc get` and `hc send`. It does not create a new listener or connection.
+**Before you add it:** the controller needs zsh 5.9 with its `zsh/system` and `zsh/files` modules, `hc` (herdr-core), `ps`, `lsof`, `jq`, `sync`, `sysctl` and BSD `stat`. Each remote Linux core needs `zsh`, `hc`, `ps`, `lsof`, `jq`, and `/proc/sys/kernel/random/boot_id`. The script reads `~/.claude/sessions/` and the first line of open Codex session files to find session IDs. It writes mode-0600 state in `~/.local/state/hc-revive/` on the controller only. It uses existing Herdr machine connections through `hc exec`; recovery happens inside one remote helper that verifies the reached core's permanent ID before using that core's local `hc get` and `hc send`. It does not create a new listener or connection.
 
 ## Add it
 
@@ -41,7 +41,7 @@ To add it by hand:
 
 There is nothing to do. Once a minute the mod saves the agents that run now. After the controller or a configured Linux core reboots, open Herdr on the controller, or add Herdr to your login items so that it opens by itself. The next tick normally starts within about a minute; completion time scales with the saved batch and unavailable or ambiguous records may instead require manual review. Agent Revive does not power on a computer or launch Herdr by itself.
 
-Clicking the text only requests an asynchronous save. Before a planned reboot, run `hc-revive save`, wait for it to return, and verify its printed entries and `snapshot.json`; do not treat the click itself as proof that current state was saved.
+Clicking the text requests an asynchronous save. The UI waits for the worker to acquire the controller lock or report that another worker already owns it. The next UI refresh reads the published files. Before a planned reboot, run `hc-revive save` directly, wait for completion, and verify the intended machines and sessions in the snapshot. A contended manual save exits unsuccessfully.
 
 To run it by hand:
 
@@ -59,7 +59,7 @@ To run it by hand:
 - A remote core that is unavailable, returns malformed discovery data, or has no current route keeps its saved and pending entries unchanged. Unavailability never causes a send or consumes a retry.
 - Remote state is keyed by the core's permanent 32-character machine ID. Aliases may change and duplicate aliases for one ID are scanned once. If a core is wiped or recreated and receives a new ID, its old entries are deliberately orphaned for manual reconciliation instead of being guessed onto the new machine.
 - Legacy v1 remote `alias/tN` rows are never mapped onto a current core ID because an alias is not permanent identity. They remain inert manual-review evidence; local v1 `tN` rows can still migrate when their command is safe.
-- Each remote send attempt is written and synced before dispatch. Only an explicit success clears it. A failed send or an ambiguous outer `hc exec` result becomes inert `delivery_unknown` evidence and is not retried automatically; reconcile that terminal manually before clearing the record. Only an explicitly busy live terminal consumes the bounded retry count.
+- Each local or remote send has a synced attempt record before dispatch. A confirmed send removes its own pending row immediately. An interrupted send or an ambiguous acknowledgement leaves evidence for manual review. Only an explicitly busy live terminal consumes a retry.
 - A power cut can lose the agents started in the last minute.
 - Programs that are not agents, such as a `tail` or a dev server, are not restarted.
 
@@ -70,7 +70,7 @@ To run it by hand:
 - Remote discovery pipes the installed `hc-revive` script to remote `zsh`; the mod does not install its files or dependencies on those cores.
 - The helper verifies the permanent core ID immediately before its local terminal check and send. Herdr 0.1.21 cannot target `hc exec` by permanent ID, so destruction or replacement of the remote core during that same helper process is not transactionally protected. Run a canary before relying on remote recovery.
 - Terminal inspection and `hc send` are not one atomic Herdr operation. There is a residual inspect/send race locally and remotely, so a canary is mandatory before relying on unattended recovery.
-- Remote sends are durably precommitted before dispatch. The inherited local-only restore path is not: if the controller process dies after a successful local `hc send` but before pending cleanup, that local command can be replayed on a later tick.
+- A manual restore imports eligible local snapshot entries into the same pending journal. A pending attempt blocks another automatic or manual dispatch for that terminal until the operator reconciles it. A separate explicit restore after a confirmed completion requests a fresh attempt.
 - The agent's own shell command must work in a login shell. The mod types `claude`, `codex` or `agy`, so a shell function or alias with your usual flags applies.
 - Working directories containing ASCII control characters are skipped. Saved commands and arbitrary legacy command text are never evaluated; v2 resume commands are rebuilt only from a supported agent name and UUID. Untrusted legacy pending records remain inert for manual inspection.
 - Atomic rename plus `sync` orders pending state before a changed boot baseline and orders the new snapshot before clearing that deferred baseline. This is not a formal macOS power-loss guarantee equivalent to `F_FULLFSYNC`.

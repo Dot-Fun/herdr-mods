@@ -69,6 +69,15 @@ if [[ ${1:-} == send ]]; then
   fi
   key=${display//\//__}
   print -r -- "$display"$'\t'"$3" >> "$HC_SEND_ATTEMPTS"
+  print -r -- "send $display" >> "$HC_EVENT_LOG"
+  if [[ -f "$HC_FIXTURES/hold.$key" ]]; then
+    : > "$HC_FIXTURES/holding.$key"
+    for _ in {1..1000}; do
+      [[ -f "$HC_FIXTURES/release.$key" ]] && break
+      /bin/sleep 0.01
+    done
+    [[ -f "$HC_FIXTURES/release.$key" ]] || exit 1
+  fi
   if [[ -f "$HC_FIXTURES/status.send.$key" ]]; then
     exit "$(<"$HC_FIXTURES/status.send.$key")"
   fi
@@ -143,7 +152,13 @@ cat > "$test_root/mocks/sleep" <<'MOCK'
 exit 0
 MOCK
 
-cat > "$test_root/mocks/mv" <<'MOCK'
+# Inject failures before the real zsh rename, which still runs in the lock owner.
+export ZDOTDIR=$test_root
+cat > "$ZDOTDIR/.zshenv" <<'MOCK'
+zf_mv() { "$HOME/.local/bin/before-publish" "$@" && builtin zf_mv "$@"; }
+MOCK
+
+cat > "$test_root/mocks/before-publish" <<'MOCK'
 #!/bin/zsh
 set -u
 print -r -- "$*" >> "$HC_MV_LOG"
@@ -153,7 +168,18 @@ if [[ ${HC_FAIL_SNAPSHOT_MV:-0} == 1 && $dest == */snapshot.json && ! -f "$HC_FI
   : > "$HC_FIXTURES/mv-failed"
   exit 1
 fi
-/bin/mv "$@"
+if [[ $dest == */pending.json && -s "$HC_SENDS" && -f "$HC_FIXTURES/fail-checkpoint" ]]; then
+  exit 1
+fi
+if [[ -f "$HC_FIXTURES/hold-rename" && ! -f "$HC_FIXTURES/holding-rename" ]]; then
+  : > "$HC_FIXTURES/holding-rename"
+  for _ in {1..1000}; do
+    [[ -f "$HC_FIXTURES/release-rename" ]] && break
+    /bin/sleep 0.01
+  done
+  : > "$HC_FIXTURES/rename-released"
+fi
+exit 0
 MOCK
 
 cat > "$test_root/mocks/sync" <<'MOCK'
@@ -289,9 +315,9 @@ for _ in {1..200}; do
   /bin/sleep 0.01
 done
 [[ -e $ready ]] || fail 'lock holder did not start'
-run_revive save >/dev/null
+if run_revive save >/dev/null; then fail 'contended save reported success'; fi
 run_revive tick
-run_revive restore
+if run_revive restore; then fail 'contended restore reported success'; fi
 cmp -s "$HC_FIXTURES/snapshot.before" "$HC_REVIVE_STATE/snapshot.json" || fail 'contended command changed the snapshot'
 [[ ! -s $HC_SENDS ]] || fail 'contended restore sent data'
 [[ -f $HC_REVIVE_STATE/mutation.lock ]] || fail 'live lock file was removed'
@@ -306,6 +332,33 @@ assert_eq "$(stat -f %i "$HC_REVIVE_STATE/mutation.lock")" "$lock_inode" 'persis
 zsh -fc 'zmodload zsh/system && zsystem flock -t 0 -f lock_fd "$1"' \
   lock-probe "$HC_REVIVE_STATE/mutation.lock" || fail 'process exit did not release mutation lock'
 pass 'save, restore, and tick share an auto-released persistent mutation lock'
+
+new_case killed_publisher
+configure_local_agent
+: > "$HC_FIXTURES/hold-rename"
+zsh "$script" save >/dev/null &
+publisher=$!
+for _ in {1..1000}; do [[ -f "$HC_FIXTURES/holding-rename" ]] && break; /bin/sleep 0.01; done
+[[ -f "$HC_FIXTURES/holding-rename" ]] || fail 'publisher did not reach rename'
+kill -KILL "$publisher"
+wait "$publisher" 2>/dev/null || true
+jq -n --arg id "$session_2" '{cwd:"/new",sessionId:$id}' > "$HOME/.claude/sessions/200.json"
+run_revive save >/dev/null
+: > "$HC_FIXTURES/release-rename"
+for _ in {1..1000}; do [[ -f "$HC_FIXTURES/rename-released" ]] && break; /bin/sleep 0.01; done
+[[ -f "$HC_FIXTURES/rename-released" ]] || fail 'released old pre-publication hook never finished'
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '.terminals | length == 1 and .[0].cwd == "/new"' 'killed owner replaced newer state'
+pass 'a killed publisher cannot rename over the next lock owner'
+
+new_case abandoned_temp
+configure_local_agent
+mkdir -p "$HC_REVIVE_STATE"
+print original > "$HC_FIXTURES/unrelated"
+ln -s "$HC_FIXTURES/unrelated" "$HC_REVIVE_STATE/.snapshot.json.tmp"
+run_revive save >/dev/null
+assert_eq "$(<"$HC_FIXTURES/unrelated")" original 'save followed a stale staging symlink'
+assert_eq "$(stat -f %Lp "$HC_REVIVE_STATE/snapshot.json")" 600 'replacement snapshot lost private mode'
+pass 'abandoned staging names cannot redirect the new snapshot'
 
 # V1 local entries migrate; remote aliases and unknown commands remain inert evidence.
 new_case migration
@@ -369,8 +422,7 @@ assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals | length == 2
 [[ ! -s $HC_SEND_ATTEMPTS ]] || fail 'migrated collision reached send'
 pass 'migration marks colliding stable terminal identities inert'
 
-# An already-v2 collision invalidates the pending batch without rewriting or
-# sending either ambiguous entry.
+# V2 pending collisions remain as inert evidence.
 new_case v2_collision
 print -r -- "{\"machines\":[{\"name\":\"new-a\",\"id\":\"$core_a\",\"state\":\"connected\"}]}" > "$HC_FIXTURES/machines.json"
 print '{"terminals":[{"address":"new-a/t1"}]}' > "$HC_FIXTURES/ls.json"
@@ -382,9 +434,82 @@ print -r -- "{\"version\":2,\"baseline\":{\"machines\":{}},\"terminals\":[
  {\"machine\":\"$core_a\",\"terminal\":\"t1\",\"cwd\":\"/two\",\"agent\":\"claude\",\"session\":\"$session_2\"}]}" > "$HC_REVIVE_STATE/pending.json"
 cp "$HC_REVIVE_STATE/pending.json" "$HC_FIXTURES/pending.before"
 run_revive tick
-cmp -s "$HC_FIXTURES/pending.before" "$HC_REVIVE_STATE/pending.json" || fail 'v2 collision was rewritten or erased'
+assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals | length == 2 and all(.legacy and .collision)' 'v2 collision evidence was lost'
 [[ ! -s $HC_SEND_ATTEMPTS ]] || fail 'v2 collision reached send'
-pass 'v2 actionable identity collisions fail closed as one batch'
+pass 'v2 pending collisions retain both rows as inert evidence'
+
+new_case snapshot_collision
+configure_local_agent
+mkdir -p "$HC_REVIVE_STATE"
+jq -n --arg id "$session_1" --arg other "$session_2" '
+ {version:2,boot:"prior",machines:{},terminals: [
+  {machine:null,terminal:"t1",cwd:"/work",agent:"codex",session:$id},
+  {machine:null,terminal:"t1",cwd:"/work",agent:"claude",session:$other},
+  {machine:null,terminal:"t2",cwd:"/work",agent:"claude",session:$other}]}' > "$HC_REVIVE_STATE/snapshot.json"
+write_get t2 '{"address":"t2","state":"live","keep":true,"pid":101,"foreground":null}'
+run_revive tick
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '[.terminals[] | select(.collision and .legacy)] | length == 2' 'snapshot collision lost evidence'
+assert_eq "$(cut -f1 "$HC_SEND_ATTEMPTS")" t2 'snapshot collision reached send or blocked independent work'
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '[.terminals[] | select(.terminal == "t1" and .legacy != true)] | length == 0' 'save reactivated an ambiguous terminal'
+pass 'snapshot collisions survive reboot selection while an independent entry resumes'
+
+new_case process_collision
+configure_local_agent
+print '300 ttys001 claude' >> "$HC_FIXTURES/ps.txt"
+jq -n --arg id "$session_2" '{cwd:"/second",sessionId:$id}' > "$HOME/.claude/sessions/300.json"
+run_revive save >/dev/null
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '.terminals | length == 2 and all(.legacy and .collision)' 'discovery chose one of two sessions on one tty'
+pass 'discovery retains different sessions observed on the same local terminal'
+
+new_case remote_process_collision
+mkdir -p "$HC_REVIVE_STATE"
+jq -n --arg core "$core_a" '{machines:[{name:"box",id:$core,state:"connected"}]}' > "$HC_FIXTURES/machines.json"
+print '{"terminals":[{"address":"box/t1"}]}' > "$HC_FIXTURES/ls.json"
+jq -n --arg boot "$boot_a1" --arg id "$session_1" --arg other "$session_2" '
+ {boot:$boot,terminals:[$id,$other | {terminal:"t1",cwd:"/work",agent:"claude",session:.}]}' > "$HC_FIXTURES/scan.box"
+jq -n --arg boot "$local_boot" --arg core "$core_a" --arg prior "$boot_a1" --arg id "$session_1" '
+ {version:2,boot:$boot,machines:{($core):$prior},terminals:[
+ {machine:$core,terminal:"t2",cwd:"/saved",agent:"codex",session:$id,seen:0}]}' > "$HC_REVIVE_STATE/snapshot.json"
+run_revive save >/dev/null
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '([.terminals[] | select(.terminal == "t1" and .legacy and .collision)] | length) == 2
+ and (.terminals | any(.terminal == "t2" and .seen == 0))' 'ambiguous scan erased a row or aged sibling evidence'
+pass 'ambiguous remote scan retains both sessions and preserves previously saved siblings'
+
+new_case local_checkpoint
+configure_local_agent
+run_revive save >/dev/null
+: > "$HC_FIXTURES/fail-checkpoint"
+if run_revive restore; then fail 'failed local completion checkpoint reported success'; fi
+assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals[0].delivery.state == "attempting"' 'local dispatch lacked durable evidence'
+awk '/^sync$/{synced=NR} /^mv pending.json$/{marked=NR} /^send t1$/{ok=marked && marked<synced && synced<NR} END{exit !ok}' "$HC_EVENT_LOG" || fail 'local send preceded durable marker'
+rm "$HC_FIXTURES/fail-checkpoint"
+run_revive restore
+run_revive tick
+assert_eq "$(wc -l < "$HC_SEND_ATTEMPTS" | tr -d ' ')" 1 'manual or automatic replayed a local send'
+assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals | length == 1 and .[0].delivery.state == "attempting"' 'local attempt evidence changed'
+pass 'local completion failure suppresses replay from both manual restore and tick'
+
+new_case scheduled_slow
+mkdir -p "$HC_REVIVE_STATE"
+jq -n --arg core "$core_a" '{machines:[{name:"slow",id:$core,state:"connected"}]}' > "$HC_FIXTURES/machines.json"
+print '{"terminals":[{"address":"slow/t1"},{"address":"slow/t2"},{"address":"slow/t3"}]}' > "$HC_FIXTURES/ls.json"
+for terminal in t1 t2 t3; do
+  write_get "slow/$terminal" "{\"address\":\"slow/$terminal\",\"state\":\"live\",\"keep\":true,\"pid\":100,\"foreground\":null}"
+done
+jq -n --arg core "$core_a" --arg id "$session_1" '{version:2,terminals:[
+ range(1;4) | {machine:$core,terminal:("t"+tostring),cwd:"/work",agent:"codex",session:$id}]}' > "$HC_REVIVE_STATE/pending.json"
+: > "$HC_FIXTURES/hold.slow__t2"
+assert_eq "$(run_revive schedule tick)" started 'worker startup handshake'
+for _ in {1..1000}; do [[ -e "$HC_FIXTURES/holding.slow__t2" ]] && break; /bin/sleep 0.01; done
+[[ -e "$HC_FIXTURES/holding.slow__t2" ]] || fail 'worker never reached slow helper'
+assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals | length == 2 and .[0].terminal == "t2" and .[0].delivery.state == "attempting" and .[1].terminal == "t3" and .[1].delivery == null' 'in-flight worker lost or repeated pending work'
+assert_eq "$(run_revive schedule tick)" busy 'second window started another worker'
+: > "$HC_FIXTURES/release.slow__t2"
+for _ in {1..1000}; do [[ ! -f "$HC_REVIVE_STATE/pending.json" ]] && break; /bin/sleep 0.01; done
+[[ ! -f "$HC_REVIVE_STATE/pending.json" ]] || fail 'worker did not finish'
+assert_eq "$(cut -f1 "$HC_SENDS")" $'slow/t1\nslow/t2\nslow/t3' 'overlapping window duplicated or skipped a dispatch'
+if HC_REVIVE_STATE="$HC_FIXTURES/ls.json" run_revive schedule tick; then fail 'failed startup was acknowledged'; fi
+pass 'UI launch returns during a blocked remote helper and a second window preserves progress'
 
 # A malformed pending file must stop the tick without being rewritten or erased.
 new_case malformed_pending
@@ -759,8 +884,7 @@ execs=$(awk '/^exec /{n++} END{print n+0}' "$HC_CALLS")
 assert_eq "$execs" 0 'alias conflict caused remote exec'
 pass 'alias conflicts fail closed without remote aging or sends'
 
-# The view distinguishes safe automatic work from inert/manual-review evidence,
-# and grows its command timeout with the largest state batch.
+# The view distinguishes safe automatic work from manual-review evidence.
 node - "${0:A:h}/mods/agent-revive/main.js" <<'NODE' || fail 'status summary or timeout logic'
 const fs = require("fs");
 const vm = require("vm");
@@ -770,8 +894,7 @@ const end = source.indexOf("export default class");
 if (start < 0 || end <= start) process.exit(1);
 const context = {};
 vm.runInNewContext(`${source.slice(start, end)}
-  globalThis.summary = pendingSummary;
-  globalThis.timeout = commandTimeout;`, context);
+  globalThis.summary = pendingSummary;`, context);
 const core = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const session1 = "11111111-1111-1111-1111-111111111111";
 const session2 = "22222222-2222-2222-2222-222222222222";
@@ -783,19 +906,18 @@ const terminals = [
   valid("t2", session2),
   { ...valid("t3", session1), legacy: true },
   { ...valid("t4", session1), delivery: { state: "delivery_unknown" } },
+  valid("t4", session2),
 ];
 const result = context.summary({ version: 2, baseline: { machines: {} }, terminals });
-if (result.total !== 5 || result.actionable !== 1 || result.review !== 4 || result.invalid) process.exit(1);
+if (result.total !== 6 || result.actionable !== 1 || result.review !== 5 || result.invalid) process.exit(1);
 if (!context.summary({ terminals: "bad" }).invalid) process.exit(1);
 if (!context.summary({ version: 1, terminals }).invalid) process.exit(1);
 if (!context.summary({ version: 2, baseline: { machines: [] }, terminals }).invalid) process.exit(1);
 if (!context.summary({ version: 2, machines: { [core]: "bad-boot" }, terminals }).invalid) process.exit(1);
-const machines = Array.from({ length: 23 }, (_, index) => index.toString(16).padStart(32, "0"));
-if (context.timeout({ total: 23, machines }, { total: 23, machines }) !== 2052000) process.exit(1);
-if (context.timeout({ total: 1, machines: [] }, { total: 5, machines: [core] }) !== 252000) process.exit(1);
+if (!source.includes('"schedule", command') || source.includes("commandTimeout")) process.exit(1);
 if (!source.includes("pending state needs review") || !source.includes("Manual-review records are not retried")) process.exit(1);
 NODE
-pass 'status separates actionable and review records with a count-derived timeout'
+pass 'status separates actionable and review records and schedules the controller'
 
 # Saved status validates its own v2 envelope and never presents inert or malformed rows
 # as agents that can resume.

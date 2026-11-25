@@ -17,6 +17,22 @@ uuid_re='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]
 core_re='[0-9a-f]{32}'
 typeset mutation_lock_fd
 
+entry_rules='def actionable:
+    type == "object" and has("machine") and (.legacy != true)
+    and (.delivery == null)
+    and (.machine == null or (((.machine | type) == "string") and (.machine | test("^[0-9a-f]{32}$"))))
+    and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
+    and ((.cwd | type) == "string"
+      and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
+    and (.agent == "codex" or .agent == "claude" or .agent == "agy")
+    and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
+    and (.tries == null or (((.tries | type) == "number") and .tries >= 0 and .tries == (.tries | floor)));
+  def identity: [.machine, .terminal] | tojson;
+  def quarantine:
+    (reduce (.[] | objects | select(actionable or .delivery != null or .collision == true)) as $e
+      ({}; .[$e | identity] += (if $e | actionable then 1 else 2 end))) as $counts
+    | map(if actionable and $counts[identity] > 1 then . + {legacy: true, collision: true} else . end);'
+
 boot() {
   if [[ -n ${HC_REVIVE_BOOT:-} ]]; then
     print -r -- "$HC_REVIVE_BOOT"
@@ -44,13 +60,12 @@ ensure_state() {
 # persistent; the fcntl lock itself is released by the kernel when this zsh exits.
 # Omitting zsystem's -e keeps the descriptor out of executed child programs.
 acquire_mutation_lock() {
-  zmodload zsh/system 2>/dev/null || return 1
-  if [[ ! -e $mutation_lock ]]; then
-    : > "$mutation_lock" || return 1
-  fi
-  [[ -f $mutation_lock && ! -L $mutation_lock ]] || return 1
+  zmodload zsh/system && zmodload -F zsh/files b:zf_mv b:zf_rm || return 1
+  [[ ! -L $mutation_lock && ( ! -e $mutation_lock || -f $mutation_lock ) ]] || return 1
+  : >> "$mutation_lock" || return 1
+  [[ -f $mutation_lock ]] || return 1
   chmod 600 "$mutation_lock" || return 1
-  zsystem flock -t 0 -f mutation_lock_fd "$mutation_lock" 2>/dev/null
+  zsystem flock -t 0.01 -i 0.01 -f mutation_lock_fd "$mutation_lock" 2>/dev/null
 }
 
 # An alias is only a route. Every remote operation proves that the core reached through it
@@ -71,11 +86,15 @@ write_json() {
   local dest data out
   dest=$1
   data=$2
-  out="$state/.${dest:t}.$$"
-  if print -r -- "$data" > "$out" && chmod 600 "$out" && mv "$out" "$dest"; then
+  out="$state/.${dest:t}.tmp"
+  # Remove any abandoned staging name, then create the private file with umask 077.
+  zf_rm -f "$out" || return 1
+  setopt localoptions noclobber
+  # Publish in the lock-owning shell. A child mv could outlive a killed owner.
+  if print -r -- "$data" > "$out" && zf_mv "$out" "$dest"; then
     return 0
   fi
-  rm -f "$out"
+  zf_rm -f "$out"
   return 1
 }
 
@@ -111,7 +130,7 @@ terminals() {
 # JSON lines: {terminal,cwd,agent,session}. One ps and one lsof cover all known agents.
 agents() {
   local rows processes lsof_raw lsof_rows terminal pid tty comm kind value file record cwd session
-  typeset -A root tty_of terminal_of cwd_of codex_file agy_id entry
+  typeset -A root tty_of terminal_of cwd_of codex_file agy_id
   local -a others files
 
   rows=$(terminals) || return 1
@@ -152,22 +171,22 @@ agents() {
 
   for pid in $others; do
     terminal=${terminal_of[${tty_of[$pid]:-none}]:-}
-    [[ -n $terminal && -z ${entry[$terminal]:-} ]] || continue
+    [[ -n $terminal ]] || continue
     if [[ -n ${codex_file[$pid]:-} ]]; then
       record=$(head -n 1 "${codex_file[$pid]}" 2>/dev/null) || continue
       cwd=$(jq -er '.payload.cwd | select(type == "string")' <<< "$record" 2>/dev/null) || continue
       session=$(jq -er '.payload.session_id | select(type == "string")' <<< "$record" 2>/dev/null) || continue
       if valid_uuid "$session" && valid_cwd "$cwd"; then
-        entry[$terminal]=$(jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
-          '{terminal: $terminal, cwd: $cwd, agent: "codex", session: $session}')
+        jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+          '{terminal: $terminal, cwd: $cwd, agent: "codex", session: $session}' || return 1
         continue
       fi
     fi
     cwd=${cwd_of[$pid]:-}
     session=${agy_id[$pid]:-}
     if [[ -n $cwd ]] && valid_uuid "$session" && valid_cwd "$cwd"; then
-      entry[$terminal]=$(jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
-        '{terminal: $terminal, cwd: $cwd, agent: "agy", session: $session}')
+      jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+        '{terminal: $terminal, cwd: $cwd, agent: "agy", session: $session}' || return 1
     fi
   done
 
@@ -180,19 +199,19 @@ agents() {
     cwd=$(jq -er '.cwd | select(type == "string")' "$file" 2>/dev/null) || continue
     session=$(jq -er '.sessionId | select(type == "string")' "$file" 2>/dev/null) || continue
     if valid_uuid "$session" && valid_cwd "$cwd"; then
-      entry[$terminal]=$(jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
-        '{terminal: $terminal, cwd: $cwd, agent: "claude", session: $session}')
+      jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+        '{terminal: $terminal, cwd: $cwd, agent: "claude", session: $session}' || return 1
     fi
   done
 
-  for terminal in ${(k)entry}; do print -r -- "${entry[$terminal]}"; done
+  return 0
 }
 
 discover_agents() {
   local lines
   lines=$(agents) || return 1
   if [[ -n $lines ]]; then
-    print -r -- "$lines" | jq -cs '.'
+    print -r -- "$lines" | jq -cs 'unique'
   else
     print '[]'
   fi
@@ -271,7 +290,6 @@ scan_alias() {
           and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
         and (.agent == "codex" or .agent == "claude" or .agent == "agy")
         and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))))
-    | select((.terminals | map(.terminal) | unique | length) == (.terminals | length))
     | {boot, terminals: [.terminals[] | {terminal, cwd, agent, session}]}
   ' <<< "$raw"
 }
@@ -308,7 +326,7 @@ probe_core_boot() {
 # Entries that cannot be mapped or validated remain inert evidence and are never sent or aged.
 normalize_file() {
   local file=$1 aliases=$2 normalized current
-  normalized=$(jq -ce --arg uuid "$uuid_re" --argjson aliases "$aliases" '
+  normalized=$(jq -ce --arg uuid "$uuid_re" --argjson aliases "$aliases" "$entry_rules"'
     def safe_cwd:
       type == "string"
       and (test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]") | not);
@@ -333,19 +351,7 @@ normalize_file() {
       elif ((.address | type) == "string" and (.address | test("^t[0-9]+$")))
       then {machine: null, terminal: .address}
       else null end;
-    def actionable:
-      type == "object" and has("machine") and .legacy != true and .delivery == null
-      and (.machine == null or (((.machine | type) == "string")
-        and (.machine | test("^[0-9a-f]{32}$"))))
-      and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
-      and ((.cwd | type) == "string"
-        and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
-      and (.agent == "codex" or .agent == "claude" or .agent == "agy")
-      and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
-      and (.tries == null or (((.tries | type) == "number")
-        and .tries >= 0 and .tries == (.tries | floor)));
-    def identity: ((.machine // "local") + "/" + .terminal);
-    if type != "object" or (.terminals | type) != "array"
+    if type != "object" or ((.version // 1) != 1 and .version != 2) or (.terminals | type) != "array"
         or ((.machines // {}) | type) != "object" or (.boot == null)
       then error("invalid snapshot") else . end
     | (.machines // {}) as $machines
@@ -362,18 +368,13 @@ normalize_file() {
         | ($tries == null or (($tries | type) == "number"
             and $tries >= 0 and $tries == ($tries | floor))) as $tries_ok
         | if ($command == null or $place == null or ($cwd_ok | not) or ($tries_ok | not)
-            or $entry.delivery != null)
+            or $entry.legacy == true or $entry.delivery != null)
           then ($entry + {legacy: true} | del(.migration))
           else {machine: $place.machine, terminal: $place.terminal, cwd: $entry.cwd,
             agent: $command.agent, session: $command.session,
             seen: (if ($entry.seen | type) == "number" then $entry.seen else 0 end)}
             + (if $tries == null then {} else {tries: $tries} end) end
-      ]}) as $normalized
-    | (reduce ($normalized.terminals[] | select(actionable)) as $entry ({};
-        .[$entry | identity] = ((.[$entry | identity] // 0) + 1))) as $counts
-    | $normalized
-    | .terminals |= map(if actionable and ($counts[identity] > 1)
-        then . + {legacy: true, collision: true} else . end)
+      ]}) | .terminals |= quarantine
   ' "$file") || return 1
   current=$(jq -c '.' "$file") || return 1
   if [[ $normalized == "$current" ]]; then
@@ -383,12 +384,20 @@ normalize_file() {
   fi
 }
 
+quarantine_file() {
+  local file=$1 updated
+  updated=$(jq -cse --arg uuid "$uuid_re" "$entry_rules"'
+    select(length == 1) | .[0] | . as $old | .terminals |= quarantine
+    | if . == $old then "" else . end' "$file") || return 1
+  [[ $updated == '""' ]] || write_json "$file" "$updated"
+}
+
 ensure_snapshot_v2() {
   local aliases=$1 version
   [[ -f $snap ]] || return 0
   chmod 600 "$snap" || return 1
-  version=$(jq -r '.version // 1' "$snap" 2>/dev/null) || return 1
-  if [[ $version != 2 || $(jq -r '[.terminals[]? | select(.migration == true)] | length' "$snap") != 0 ]]; then
+  version=$(jq -rse 'select(length == 1) | .[0] | .version // 1' "$snap" 2>/dev/null) || return 1
+  if [[ $version != 2 || $(jq -r '[.terminals[]? | objects | select(.migration == true)] | length' "$snap") != 0 ]]; then
     normalize_file "$snap" "$aliases" || return 1
   else
     jq -e --arg uuid "$uuid_re" '
@@ -397,7 +406,7 @@ ensure_snapshot_v2() {
       and (.machines | to_entries | all(.[]; (.key | test("^[0-9a-f]{32}$"))
         and ((.value | type) == "string") and (.value | test("^" + $uuid + "$"))))
     ' "$snap" >/dev/null || return 1
-    chmod 600 "$snap" || return 1
+    quarantine_file "$snap" || return 1
   fi
 }
 
@@ -405,23 +414,11 @@ ensure_pending_v2() {
   local aliases=$1 version
   [[ -f $pending ]] || return 0
   chmod 600 "$pending" || return 1
-  version=$(jq -r '.version // 1' "$pending" 2>/dev/null) || return 1
-  if [[ $version != 2 || $(jq -r '[.terminals[]? | select(.migration == true)] | length' "$pending") != 0 ]]; then
+  version=$(jq -rse 'select(length == 1) | .[0] | .version // 1' "$pending" 2>/dev/null) || return 1
+  if [[ $version != 2 || $(jq -r '[.terminals[]? | objects | select(.migration == true)] | length' "$pending") != 0 ]]; then
     normalize_file "$pending" "$aliases" || return 1
   fi
   jq -e --arg uuid "$uuid_re" '
-    def actionable:
-      type == "object" and has("machine") and .legacy != true and .delivery == null
-      and (.machine == null or (((.machine | type) == "string")
-        and (.machine | test("^[0-9a-f]{32}$"))))
-      and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
-      and ((.cwd | type) == "string"
-        and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
-      and (.agent == "codex" or .agent == "claude" or .agent == "agy")
-      and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
-      and (.tries == null or (((.tries | type) == "number")
-        and .tries >= 0 and .tries == (.tries | floor)));
-    def identity: ((.machine // "local") + "/" + .terminal);
     type == "object" and .version == 2 and (.terminals | type) == "array"
     and (.boot == null or ((.boot | type) == "string") or ((.boot | type) == "number"))
     and (.machines == null or (
@@ -443,9 +440,8 @@ ensure_pending_v2() {
           and (.value | test("^" + $uuid + "$"))))
       )
     )
-    and ([.terminals[] | select(actionable) | identity] as $identities
-      | ($identities | length) == ($identities | unique | length))
   ' "$pending" >/dev/null || return 1
+  quarantine_file "$pending"
 }
 
 save_unlocked() {
@@ -490,24 +486,28 @@ save_unlocked() {
   fi
 
   output=$(jq -cn --arg boot "$current" --argjson now "$(date +%s)" --argjson old "$old" \
-    --argjson local "$local_found" --argjson scans "$scans_json" '
-    ([$local[] | . + {machine: null, seen: $now}]
-      + [$scans[] as $scan | $scan.terminals[] | . + {machine: $scan.machine, seen: $now}]) as $new
-    | ($scans | map(.machine)) as $successful
+    --argjson local "$local_found" --argjson scans "$scans_json" --arg uuid "$uuid_re" "$entry_rules"'
+    (reduce ($old.terminals[] | objects | select(.collision == true or .delivery != null)) as $row
+      ({}; .[$row | identity] = true)) as $blocked
+    | ([$local[] | . + {machine: null, seen: $now}]
+      + [$scans[] as $scan | $scan.terminals[] | . + {machine: $scan.machine, seen: $now}] | map(select($blocked[identity] != true))) as $new
+    | ($scans | map(select(.terminals | group_by(.terminal) | all(length == 1)) | .machine)) as $successful
     | (reduce $scans[] as $scan ($old.machines; .[$scan.machine] = $scan.boot)) as $machines
     | [$old.terminals[]?
         | . as $prior
-        | select(if (type != "object" or .legacy == true or (has("machine") | not)) then true
+        | select(if (actionable | not) then true
             else (.machine // "local") as $machine | .terminal as $terminal
               | ($new | all((.machine // "local") != $machine or .terminal != $terminal)) end)
-        | select(if (type != "object" or .legacy == true or (has("machine") | not)) then true
+        | select(if (actionable | not) then true
             elif .machine == null then (($local | length) == 0 or ((.seen // 0) > $now - 300))
             elif ($successful | index($prior.machine)) == null then true
             else ((.seen // 0) > $now - 300) end)] as $kept
-    | {version: 2, boot: $boot, machines: $machines, terminals: ($new + $kept)}
+    | {version: 2, boot: $boot, machines: $machines, terminals: ($new + $kept | quarantine)}
   ') || return 1
   write_json "$snap" "$output" || return 1
-  jq -r '.terminals[] | select(type == "object" and .legacy != true and has("machine"))
+  command sync >/dev/null 2>&1 || return 1
+  jq -r --arg uuid "$uuid_re" "$entry_rules"'.machines as $cores | .terminals[] | select(actionable)
+    | select(.machine == null or (.machine as $id | $cores | has($id)))
     | [((.machine // "local") + "/" + .terminal),
       (if .agent == "codex" then "codex resume " + .session
        elif .agent == "claude" then "claude --resume " + .session
@@ -515,17 +515,7 @@ save_unlocked() {
 }
 
 valid_entry() {
-  jq -e --arg uuid "$uuid_re" '
-    type == "object" and has("machine") and (.legacy != true)
-    and (.delivery == null)
-    and (.machine == null or (((.machine | type) == "string") and (.machine | test("^[0-9a-f]{32}$"))))
-    and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
-    and ((.cwd | type) == "string"
-      and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
-    and (.agent == "codex" or .agent == "claude" or .agent == "agy")
-    and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
-    and (.tries == null or (((.tries | type) == "number") and .tries >= 0 and .tries == (.tries | floor)))
-  ' >/dev/null
+  jq -e --arg uuid "$uuid_re" "$entry_rules"'actionable' >/dev/null
 }
 
 entry_command() {
@@ -603,127 +593,74 @@ restore_alias() {
   ' <<< "$raw"
 }
 
-mark_delivery() {
-  local entry=$1 delivery_state=$2 alias=$3 attempt=$4
-  jq -c --arg state "$delivery_state" --arg route "$alias" --arg attempt "$attempt" \
-    '.delivery = {state: $state, route: $route, attempt: $attempt}' <<< "$entry"
+# Compare the whole row so stale or ambiguous state cannot authorize a dispatch.
+replace_pending_entry() {
+  local before=$1 after=$2 updated
+  updated=$(jq -ce --argjson before "$before" --argjson after "$after" '
+    if ([.terminals[] | select(. == $before)] | length) != 1 then error("pending row changed")
+    else .terminals |= map(if . != $before then . elif $after == null then empty else $after end)
+    | .tries = ([.terminals[] | objects | .tries | numbers | select(. >= 0 and . == floor)] | max // 0)
+    end' "$pending") || return 1
+  write_json "$pending" "$updated"
 }
 
-# A remote send is never dispatched until its attempt marker has been atomically renamed
-# and synced. A crash or ambiguous outer exec leaves that marker inert for manual review.
-precommit_remote_attempt() {
-  local file=$1 entry=$2 alias=$3 attempt updated
-  [[ $file == "$pending" ]] || return 1
-  attempt="$(date +%s)-$$-${RANDOM:-0}"
-  updated=$(jq -ce --argjson entry "$entry" --arg route "$alias" --arg attempt "$attempt" '
-    def same:
-      .machine == $entry.machine and .terminal == $entry.terminal
-      and .cwd == $entry.cwd and .agent == $entry.agent and .session == $entry.session
-      and .legacy != true and .delivery == null;
-    if (([.terminals[] | select(same)] | length) != 1)
-      then error("pending entry changed before remote attempt")
-    else .terminals |= map(if same
-      then . + {delivery: {state: "attempting", route: $route, attempt: $attempt}}
-      else . end) end
-  ' "$file") || return 1
-  write_json "$file" "$updated" || return 1
-  command sync >/dev/null 2>&1 || return 1
-  print -r -- "$attempt"
-}
-
-# Prints JSON lines for entries still pending. A remote entry with no current identity-checked
-# route is returned byte-for-byte: unavailability never consumes its retry budget.
-restore() {
-  local file=${1:-$snap} inventory=${2:-} entries entry machine terminal cwd command alias terminal_status tries
-  local agent session outcome attempt busy
-  [[ -f $file ]] || return 0
-  if [[ -z $inventory ]]; then
-    inventory=$(machine_inventory) || inventory='{"aliases":{},"routes":{},"addresses":[]}'
-  fi
-  jq -e 'type == "object" and (.terminals | type) == "array"' "$file" >/dev/null || return 1
-  entries=$(jq -c '.terminals[]' "$file") || return 1
-  while read -r entry; do
+restore_pending() {
+  local inventory=$1 selection=$2 entries entry machine terminal cwd agent session alias
+  local outcome marked replacement command line tries
+  [[ -f $pending ]] || return 0
+  entries=$(jq -c --arg uuid "$uuid_re" --argjson selection "$selection" "$entry_rules"'
+    .terminals[] | select(actionable) | . as $entry
+    | select($selection == null or any($selection[];
+        .machine == $entry.machine and .terminal == $entry.terminal
+        and .cwd == $entry.cwd and .agent == $entry.agent and .session == $entry.session))' "$pending") || return 1
+  while IFS= read -r entry; do
     [[ -n $entry ]] || continue
-    busy=false
-    if ! valid_entry <<< "$entry"; then
-      echo "skip invalid saved entry" >&2
-      # Pending recovery state is evidence. Keep untrusted or legacy records inert instead of
-      # deleting them merely because this version cannot safely rebuild their command.
-      print -r -- "$entry"
-      continue
-    fi
-    machine=$(jq -r '.machine // empty' <<< "$entry")
-    terminal=$(jq -r '.terminal' <<< "$entry")
+    machine=$(jq -r '.machine // empty' <<< "$entry") || return 1
+    terminal=$(jq -r '.terminal' <<< "$entry") || return 1
+    cwd=$(jq -r '.cwd' <<< "$entry") || return 1
+    alias=local
     if [[ -n $machine ]]; then
       alias=$(jq -r --arg machine "$machine" --arg terminal "$terminal" '
         .addresses as $addresses
         | first(.routes[$machine][]? as $alias
             | select($addresses | index($alias + "/" + $terminal)) | $alias) // empty
-      ' <<< "$inventory") || alias=''
-      if [[ -z $alias || $file != "$pending" ]]; then
-        print -r -- "$entry"
-        continue
-      fi
-      cwd=$(jq -r '.cwd' <<< "$entry")
-      agent=$(jq -r '.agent' <<< "$entry")
-      session=$(jq -r '.session' <<< "$entry")
-      attempt=$(precommit_remote_attempt "$file" "$entry" "$alias") || {
-        print -r -- "$entry"
-        continue
-      }
-      outcome=$(restore_alias "$alias" "$machine" "$terminal" "$cwd" "$agent" "$session") || {
-        mark_delivery "$entry" delivery_unknown "$alias" "$attempt" || return 1
-        continue
-      }
-      case $outcome in
-      sent)
-        echo "revived $alias/$terminal" >&2
-        sleep 0.1
-        continue
-        ;;
-      busy) busy=true ;;
-      unavailable|identity_mismatch)
-        print -r -- "$entry"
-        continue
-        ;;
-      send_failed)
-        mark_delivery "$entry" delivery_unknown "$alias" "$attempt" || return 1
-        continue
-        ;;
-      esac
+      ' <<< "$inventory") || return 1
+      [[ -n $alias ]] || continue
+      agent=$(jq -r '.agent' <<< "$entry") || return 1
+      session=$(jq -r '.session' <<< "$entry") || return 1
     else
-      command=$(entry_command "$entry") || {
-        print -r -- "$entry"
-        continue
-      }
-      cwd=$(jq -r '.cwd' <<< "$entry")
-      terminal_status=$(inspect_terminal "$terminal") || {
-        print -r -- "$entry"
-        continue
-      }
-      if [[ $terminal_status == shell ]]; then
-        if hc send "$terminal" "$(jq -nr --arg cwd "$cwd" --arg command "$command" \
-            '"cd \($cwd | @sh) && \($command)"')" >/dev/null; then
-          echo "revived $terminal" >&2
-          sleep 0.1
-          continue
-        fi
-        print -r -- "$entry"
-        continue
-      fi
-      busy=true
+      command=$(entry_command "$entry") || return 1
+      line=$(jq -nr --arg cwd "$cwd" --arg command "$command" '"cd \($cwd | @sh) && \($command)"') || return 1
     fi
-    [[ $busy == true ]] || {
-      print -r -- "$entry"
-      continue
-    }
-    tries=$(jq -r '.tries // 0' <<< "$entry")
-    if (( tries < 9 )); then
-      jq -c --argjson tries "$((tries + 1))" '.tries = $tries' <<< "$entry" || return 1
+    marked=$(jq -c --arg route "$alias" --arg attempt "$(date +%s)-$$-$RANDOM" '
+      .delivery = {state:"attempting", route:$route, attempt:$attempt}' <<< "$entry") || return 1
+    replace_pending_entry "$entry" "$marked" || return 1
+    command sync >/dev/null 2>&1 || return 1
+    if [[ -n $machine ]]; then
+      outcome=$(restore_alias "$alias" "$machine" "$terminal" "$cwd" "$agent" "$session") || outcome=send_failed
     else
-      echo "gave up $terminal after 10 available tries" >&2
+      outcome=$(inspect_terminal "$terminal") || outcome=unavailable
+      if [[ $outcome == shell ]]; then
+        if hc send "$terminal" "$line" >/dev/null; then outcome=sent; else outcome=send_failed; fi
+      fi
     fi
+    case $outcome in
+    sent) replacement=null; echo "revived $alias/$terminal" >&2 ;;
+    busy)
+      tries=$(jq -r '.tries // 0' <<< "$entry") || return 1
+      if (( tries < 9 )); then
+        replacement=$(jq -c --argjson tries "$((tries + 1))" '.tries = $tries' <<< "$entry") || return 1
+      else
+        replacement=null
+        echo "gave up $terminal after 10 available tries" >&2
+      fi ;;
+    unavailable|identity_mismatch) replacement=$entry ;;
+    *) replacement=$(jq -c '.delivery.state = "delivery_unknown"' <<< "$marked") || return 1 ;;
+    esac
+    replace_pending_entry "$marked" "$replacement" || return 1
   done <<< "$entries"
+  if jq -e '.terminals == []' "$pending" >/dev/null; then zf_rm -f "$pending" || return 1; fi
+  return 0
 }
 
 advance_pending_baseline() {
@@ -747,7 +684,7 @@ advance_pending_baseline() {
 }
 
 merge_pending() {
-  local additions=$1 baseline=$2 existing merged
+  local additions=$1 baseline=$2 manual=${3:-false} existing merged
   if [[ -f $pending ]]; then
     existing=$(jq -ce 'select(type == "object" and (.terminals | type) == "array")
       | .baseline = (.baseline // {machines: {}})' "$pending") || return 1
@@ -755,28 +692,19 @@ merge_pending() {
     existing='{"version":2,"tries":0,"terminals":[],"machines":{},"baseline":{"machines":{}}}'
   fi
   merged=$(jq -cn --arg uuid "$uuid_re" --argjson old "$existing" \
-    --argjson additions "$additions" --argjson baseline "$baseline" '
-    def actionable:
-      type == "object" and has("machine") and .legacy != true and .delivery == null
-      and (.machine == null or (((.machine | type) == "string")
-        and (.machine | test("^[0-9a-f]{32}$"))))
-      and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
-      and ((.cwd | type) == "string"
-        and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
-      and (.agent == "codex" or .agent == "claude" or .agent == "agy")
-      and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
-      and (.tries == null or (((.tries | type) == "number")
-        and .tries >= 0 and .tries == (.tries | floor)));
-    def key: ((.machine // "local") + "/" + .terminal);
+    --argjson additions "$additions" --argjson baseline "$baseline" --argjson manual "$manual" "$entry_rules"'
     ([$old.terminals[] | select(actionable | not)]
       + [$additions[] | select(actionable | not)]) as $inert
     | (reduce ($old.terminals[] | select(actionable)) as $entry ({};
-        .[$entry | key] = $entry)) as $old_actionable
+        .[$entry | identity] = $entry)) as $old_actionable
+    | (reduce ($inert[] | objects | select(.delivery != null or .collision == true)) as $row
+        ({}; .[$row | identity] = true)) as $blocked
     | (reduce ($additions[] | select(actionable)) as $entry ($old_actionable;
-        .[$entry | key] = $entry)) as $selected
+        ($entry | identity) as $key
+        | if $manual and (has($key) or $blocked[$key]) then . else .[$key] = $entry end)) as $selected
     | {version: 2, boot: ($old.boot // $baseline.boot // null),
         machines: ($old.machines // {}), tries: ($old.tries // 0),
-        terminals: ($inert + [$selected[]]),
+        terminals: ($inert + [$selected[] | if $blocked[identity] then . + {legacy:true, collision:true} else . end]),
         baseline: {boot: ($baseline.boot // $old.baseline.boot // null),
           machines: (($old.baseline.machines // {}) * ($baseline.machines // {}))}}
   ') || return 1
@@ -817,20 +745,28 @@ prepare_pending() {
   else
     updated=$(jq -ce --arg boot "$current" --argjson machines "$observed" '
       .boot = $boot | .machines = (.machines * $machines)' "$snap") || return 1
-    write_json "$snap" "$updated" || return 1
+    if [[ $updated != "$(jq -c . "$snap")" ]]; then
+      write_json "$snap" "$updated" || return 1
+      command sync >/dev/null 2>&1 || return 1
+    fi
   fi
 }
 
-finish_pending_restore() {
-  local remaining=$1 left next
-  left=$(jq -cs '.' <<< "$remaining") || return 1
-  if [[ $(jq -r 'length' <<< "$left") == 0 ]]; then
-    rm -f "$pending"
-  else
-    next=$(jq -ce --argjson terminals "$left" '.terminals = $terminals
-      | .tries = ([.terminals[].tries
-          | select(type == "number" and . >= 0 and . == floor)] | max // 0)' "$pending") || return 1
-    write_json "$pending" "$next"
+# The UI waits only until the worker owns the lock and closes its launch pipe.
+start_controller() {
+  local code
+  ensure_state || return 1
+  acquire_mutation_lock || {
+    code=$?
+    if (( code == 2 )); then
+      [[ $1 == --scheduled ]] && print busy
+      return 2
+    fi
+    return 1
+  }
+  if [[ $1 == --scheduled ]]; then
+    print started
+    exec </dev/null >/dev/null 2>&1
   fi
 }
 
@@ -844,33 +780,43 @@ remote-boot)
 remote-restore)
   remote_restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
   ;;
+schedule)
+  unsetopt BG_NICE
+  [[ ${2:-} == (save|tick) ]] || exit 2
+  ack=$(zsh "$script" "$2" --scheduled </dev/null 2>/dev/null &!)
+  [[ $ack == (started|busy) ]] || exit 1
+  print -r -- "$ack"
+  ;;
 save)
-  ensure_state || exit 1
-  acquire_mutation_lock || exit 0
+  start_controller "${2:-}" || exit 1
   save_unlocked
   ;;
 restore)
-  ensure_state || exit 1
-  acquire_mutation_lock || exit 0
+  start_controller '' || exit 1
   inventory=$(machine_inventory) || inventory='{"aliases":{},"routes":{},"addresses":[]}'
+  core_aliases=$(jq -c '.aliases' <<< "$inventory") || exit 1
   file=${2:-$snap}
-  if [[ $file == "$snap" ]]; then
-    ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || exit 1
-  elif [[ $file == "$pending" ]]; then
-    ensure_pending_v2 "$(jq -c '.aliases' <<< "$inventory")" || exit 1
-  fi
+  [[ -f $file ]] || exit 0
+  ensure_snapshot_v2 "$core_aliases" && ensure_pending_v2 "$core_aliases" || exit 1
+  advance_pending_baseline || exit 1
   if [[ $file == "$pending" ]]; then
-    advance_pending_baseline || exit 1
-    remaining=$(restore "$file" "$inventory") || exit 1
-    finish_pending_restore "$remaining" || exit 1
+    restore_pending "$inventory" null
   else
-    restore "$file" "$inventory" >/dev/null
+    selection=$(jq -cse --arg uuid "$uuid_re" "$entry_rules"'
+      select(length == 1) | .[0] | select(type == "object" and .version == 2) | .terminals | arrays | quarantine
+      | map(select(actionable and .machine == null))' "$file") || exit 1
+    [[ $selection != '[]' ]] || exit 0
+    prepare_pending "$inventory" || exit 1
+    merge_pending "$selection" '{"machines":{}}' true || exit 1
+    restore_pending "$inventory" "$selection"
   fi
   ;;
 tick)
+  start_controller "${2:-}" || {
+    (( $? == 2 )) && exit 0
+    exit 1
+  }
   hc server status --json >/dev/null 2>&1 || exit 0
-  ensure_state || exit 1
-  acquire_mutation_lock || exit 0
 
   inventory=$(machine_inventory) || inventory='{"aliases":{},"routes":{},"addresses":[]}'
   ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || exit 0
@@ -885,8 +831,7 @@ tick)
   prepare_pending "$inventory" || exit 0
 
   if [[ -f $pending ]]; then
-    remaining=$(restore "$pending" "$inventory") || exit 0
-    finish_pending_restore "$remaining" || exit 0
+    restore_pending "$inventory" null || exit 0
   fi
   save_unlocked >/dev/null
   ;;

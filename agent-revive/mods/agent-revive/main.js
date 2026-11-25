@@ -30,6 +30,11 @@ function terminalSummary(terminals, eligible = () => true) {
     && (entry.tries == null || (Number.isInteger(entry.tries) && entry.tries >= 0))
     && eligible(entry));
   const identityCounts = new Map();
+  for (const entry of terminals) {
+    if (entry && (entry.delivery != null || entry.collision === true)) {
+      identityCounts.set(`${entry.machine ?? "local"}/${entry.terminal}`, 2);
+    }
+  }
   for (const entry of candidates) {
     const identity = `${entry.machine ?? "local"}/${entry.terminal}`;
     identityCounts.set(identity, (identityCounts.get(identity) ?? 0) + 1);
@@ -40,8 +45,6 @@ function terminalSummary(terminals, eligible = () => true) {
     total: terminals.length,
     actionable,
     review: terminals.length - actionable,
-    machines: terminals.map((entry) => entry?.machine)
-      .filter((id) => typeof id === "string" && core.test(id)),
   };
 }
 
@@ -51,7 +54,7 @@ function savedSummary(document) {
   if (!document || typeof document !== "object" || Array.isArray(document)
       || document.version !== 2 || !validBoot(document.boot)
       || !validMachineMap(document.machines) || !Array.isArray(document.terminals)) {
-    return { total: 0, actionable: 0, review: 0, invalid: true, missing: false, machines: [] };
+    return { total: 0, actionable: 0, review: 0, invalid: true, missing: false };
   }
   const summary = terminalSummary(document.terminals,
     (entry) => entry.machine == null
@@ -60,7 +63,6 @@ function savedSummary(document) {
     ...summary,
     invalid: false,
     missing: false,
-    machines: [...new Set([...Object.keys(document.machines), ...summary.machines])],
   };
 }
 
@@ -89,26 +91,12 @@ function pendingSummary(document) {
     return { total: 0, actionable: 0, review: 0, invalid: true };
   }
   const summary = terminalSummary(document.terminals);
-  return {
-    ...summary,
-    invalid: false,
-    machines: [...new Set([
-      ...Object.keys(document.machines ?? {}),
-      ...Object.keys(document.baseline?.machines ?? {}),
-      ...summary.machines,
-    ])],
-  };
-}
-
-function commandTimeout(saved, pending) {
-  const machines = new Set([...(saved.machines ?? []), ...(pending.machines ?? [])]);
-  // Budget both batches plus boot/scan work and several alias fallbacks per recorded core.
-  return 120000 + (saved.total + pending.total) * 12000 + machines.size * 60000;
+  return { ...summary, invalid: false };
 }
 
 export default class AgentRevive extends View {
   init(_props, cx) {
-    this.saved = { total: 0, actionable: 0, review: 0, invalid: false, missing: true, machines: [] };
+    this.saved = { total: 0, actionable: 0, review: 0, invalid: false, missing: true };
     this.pending = { total: 0, actionable: 0, review: 0, invalid: false };
     if (checking()) return;
     this.tick("tick", cx);
@@ -121,27 +109,25 @@ export default class AgentRevive extends View {
       const readSaved = async () => {
         let text;
         try { text = await readTextFile(`${state}/snapshot.json`); } catch {
-          return { total: 0, actionable: 0, review: 0, invalid: false, missing: true, machines: [] };
+          return { total: 0, actionable: 0, review: 0, invalid: false, missing: true };
         }
         try { return savedSummary(JSON.parse(text)); } catch {
-          return { total: 0, actionable: 0, review: 0, invalid: true, missing: false, machines: [] };
+          return { total: 0, actionable: 0, review: 0, invalid: true, missing: false };
         }
       };
       const readPending = async () => {
         let text;
         try { text = await readTextFile(`${state}/pending.json`); } catch {
-          return { total: 0, actionable: 0, review: 0, invalid: false, machines: [] };
+          return { total: 0, actionable: 0, review: 0, invalid: false };
         }
         try { return pendingSummary(JSON.parse(text)); } catch {
-          return { total: 0, actionable: 0, review: 0, invalid: true, machines: [] };
+          return { total: 0, actionable: 0, review: 0, invalid: true };
         }
       };
-      const savedBefore = await readSaved();
-      const pendingBefore = await readPending();
       try {
-        await exec("zsh", [`${appHome()}/mods/agent-revive/hc-revive`, command],
-          { timeout: commandTimeout(savedBefore, pendingBefore) });
-      } catch {}
+        const result = await exec("zsh", [`${appHome()}/mods/agent-revive/hc-revive`, "schedule", command]);
+        this.launchFailed = result.code !== 0 || !["started", "busy"].includes(result.stdout.trim());
+      } catch { this.launchFailed = true; }
       this.saved = await readSaved();
       this.pending = await readPending();
       cx.notify();
@@ -154,13 +140,13 @@ export default class AgentRevive extends View {
     const hasPending = actionable > 0 || review > 0 || invalid;
     const savedNeedsReview = this.saved.invalid || this.saved.review > 0;
     const reviewText = review === 1 ? "1 entry needs review" : `${review} entries need review`;
-    const text = actionable > 0
+    const text = this.launchFailed ? "recovery worker failed to start" : actionable > 0
       ? `resuming ${actionable} agent${actionable === 1 ? "" : "s"}${review ? `; ${reviewText}` : "…"}`
       : invalid ? "pending state needs review"
         : review ? reviewText
           : savedStatus(this.saved);
     return h_flex().size_full().px(14).items_center().justify_end().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8)
-      .child(div().id("revive-save").text_color(hasPending || savedNeedsReview ? t.working : t.dim).hover((s) => s.text_color(t.foreground))
+      .child(div().id("revive-save").text_color(this.launchFailed || hasPending || savedNeedsReview ? t.working : t.dim).hover((s) => s.text_color(t.foreground))
         .tooltip("Agents that resume after a reboot. Manual-review records are not retried. Click to save now.")
         .on_click((_e, cx) => this.tick("save", cx)).child(`↻ ${text}`));
   }

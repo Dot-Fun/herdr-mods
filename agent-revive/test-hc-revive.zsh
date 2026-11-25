@@ -70,6 +70,15 @@ if [[ ${1:-} == send ]]; then
   key=${display//\//__}
   print -r -- "$display"$'\t'"$3" >> "$HC_SEND_ATTEMPTS"
   print -r -- "send $display" >> "$HC_EVENT_LOG"
+  if [[ -f "$HC_FIXTURES/hang.$key" ]]; then
+    # This helper and its child wait until fixture teardown, even across TERM.
+    trap '' TERM
+    (while [[ -f "$HC_FIXTURES/hang.$key" ]]; do /bin/sleep 0.2; done) &
+    child=$!
+    print -r -- "$$ $child" > "$HC_FIXTURES/hung.$key"
+    wait "$child"
+    exit 1
+  fi
   if [[ -f "$HC_FIXTURES/hold.$key" ]]; then
     : > "$HC_FIXTURES/holding.$key"
     for _ in {1..1000}; do
@@ -234,6 +243,14 @@ write_get() {
   print -r -- "$body" > "$HC_FIXTURES/get.${address//\//__}.json"
 }
 old_mtime() { touch -t 202001010000 "$1"; }
+wait_worker() {
+  local want=$1
+  for _ in {1..500}; do
+    if jq -e --arg want "$want" '.status == $want' "$HC_REVIVE_STATE/worker.json" >/dev/null 2>&1; then return 0; fi
+    /bin/sleep 0.02
+  done
+  fail "worker never reported $want"
+}
 configure_local_agent() {
   print '{"terminals":[{"address":"t1"}]}' > "$HC_FIXTURES/ls.json"
   write_get t1 '{"address":"t1","state":"live","keep":true,"pid":100,"foreground":null}'
@@ -510,6 +527,83 @@ for _ in {1..1000}; do [[ ! -f "$HC_REVIVE_STATE/pending.json" ]] && break; /bin
 assert_eq "$(cut -f1 "$HC_SENDS")" $'slow/t1\nslow/t2\nslow/t3' 'overlapping window duplicated or skipped a dispatch'
 if HC_REVIVE_STATE="$HC_FIXTURES/ls.json" run_revive schedule tick; then fail 'failed startup was acknowledged'; fi
 pass 'UI launch returns during a blocked remote helper and a second window preserves progress'
+
+new_case worker_deadline
+mkdir -p "$HC_REVIVE_STATE"
+configure_local_agent
+jq -n --arg id "$session_1" '{version:2,terminals:[
+  {machine:null,terminal:"t1",cwd:"/work",agent:"codex",session:$id}]}' > "$HC_REVIVE_STATE/pending.json"
+: > "$HC_FIXTURES/hang.t1"
+# A private fixture group models a UI runtime canceling its entire exec group.
+HC_REVIVE_WORKER_SECONDS=4 /usr/bin/perl -MPOSIX -e '
+  my $session = POSIX::setsid();
+  defined($session) && $session == $$ or die "setsid: $!";
+  system(@ARGV) == 0 or exit 1;
+  sleep 30;
+' /bin/zsh "$script" schedule tick > "$HC_FIXTURES/ui-ack" &
+launcher=$!
+for _ in {1..400}; do [[ -s "$HC_FIXTURES/ui-ack" ]] && break; /bin/sleep 0.01; done
+assert_eq "$(<"$HC_FIXTURES/ui-ack")" started 'watchdog startup'
+kill -KILL -- "-$launcher"
+wait "$launcher" 2>/dev/null || true
+for _ in {1..400}; do [[ -s "$HC_FIXTURES/hung.t1" ]] && break; /bin/sleep 0.01; done
+[[ -s "$HC_FIXTURES/hung.t1" ]] || fail 'send did not reach the stalled helper'
+read -r helper child < "$HC_FIXTURES/hung.t1"
+assert_eq "$(run_revive schedule tick)" busy 'overlap during hung dispatch'
+for _ in {1..500}; do
+  if ! kill -0 "$helper" 2>/dev/null && ! kill -0 "$child" 2>/dev/null; then break; fi
+  /bin/sleep 0.02
+done
+if kill -0 "$helper" 2>/dev/null || kill -0 "$child" 2>/dev/null; then fail 'hung helper or descendant survived deadline'; fi
+assert_jq "$HC_REVIVE_STATE/worker.json" '.status == "running" and .deadline <= now' 'unreported expired worker'
+assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals[0].delivery.state == "attempting"' 'watchdog lost in-flight attempt'
+assert_eq "$(run_revive schedule tick)" started 'watchdog failed to release lock'
+wait_worker succeeded
+assert_eq "$(wc -l < "$HC_SEND_ATTEMPTS" | tr -d ' ')" 1 'timed-out dispatch replayed'
+pass 'independent watchdog kills a stuck helper and its descendant, releases lock, and preserves attempt'
+
+new_case worker_failure
+configure_local_agent
+run_revive save >/dev/null
+prior=$(<"$HC_REVIVE_STATE/snapshot.json")
+jq -n --arg id "$session_2" '{cwd:"/new",sessionId:$id}' > "$HOME/.claude/sessions/200.json"
+assert_eq "$(HC_FAIL_SNAPSHOT_MV=1 run_revive schedule save)" started 'save never acknowledged'
+wait_worker failed
+assert_eq "$(<"$HC_REVIVE_STATE/snapshot.json")" "$prior" 'failed save changed snapshot'
+assert_eq "$(stat -f %Lp "$HC_REVIVE_STATE/worker.json")" 600 'worker record permissions'
+node - "${0:A:h}/mods/agent-revive/main.js" "$HC_REVIVE_STATE/worker.json" <<'NODE' || fail 'worker failure hidden in UI'
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[2], "utf8");
+const state = require("path").dirname(process.argv[3]);
+let refresh, label;
+const element = new Proxy({}, { get: (_, key) => (...args) => {
+  if (key === "child" && typeof args[0] === "string") label = args[0];
+  return element;
+}});
+const context = {
+  View: class {}, home: () => "", theme: () => ({}), div: () => element, h_flex: () => element,
+  readTextFile: (path) => fs.promises.readFile(state + "/" + path.split("/").pop(), "utf8"),
+};
+vm.runInNewContext(source.slice(source.indexOf("const uuid ="))
+  .replace("export default class AgentRevive", "globalThis.AgentRevive = class"), context);
+const status = context.workerStatus;
+if (status({status:"running", deadline:90}, 90) !== "recovery worker timed out"
+    || status({status:"running", deadline:90, priorFailure:true}, 80) !== "retrying failed recovery"
+    || status({status:"succeeded", finished:50}, 500) !== "recovery status is stale"
+    || status({status:"succeeded", finished:50}, 55) !== null) process.exit(1);
+const view = new context.AgentRevive();
+view.refreshId = 0;
+view.tick(null, { spawn: (callback) => { refresh = callback({ notify() {} }); } });
+refresh.then(() => {
+  view.render();
+  if (view.saved.actionable !== 1 || label !== "↻ recovery worker failed") process.exit(1);
+}).catch(error => { console.error(error); process.exit(1); });
+NODE
+assert_eq "$(run_revive schedule tick)" started 'retry did not acquire lock'
+wait_worker succeeded
+assert_jq "$HC_REVIVE_STATE/snapshot.json" '.terminals[0].cwd == "/new"' 'recent snapshot masked failed refresh'
+pass 'post-acknowledgement publication failure reaches the UI and forces a fresh retry'
 
 # A malformed pending file must stop the tick without being rewritten or erased.
 new_case malformed_pending

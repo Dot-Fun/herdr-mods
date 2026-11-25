@@ -12,6 +12,7 @@ state=${HC_REVIVE_STATE:-$HOME/.local/state/hc-revive}
 snap=$state/snapshot.json
 pending=$state/pending.json
 mutation_lock=$state/mutation.lock
+incomplete=false
 script=${0:A}
 uuid_re='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
 core_re='[0-9a-f]{32}'
@@ -450,11 +451,12 @@ save_unlocked() {
   local -a scans cores
 
   current=$(boot) || return 1
-  inventory=$(machine_inventory) || { inventory='{"aliases":{},"routes":{},"addresses":[]}'; routes_ok=false; }
+  inventory=$(machine_inventory) || { inventory='{"aliases":{},"routes":{},"addresses":[]}'; routes_ok=false; incomplete=true; }
   ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 1
   if [[ -f $snap ]]; then
     old_boot=$(jq -r '.boot | tostring' "$snap") || return 1
     if [[ $old_boot != "$current" ]]; then
+      incomplete=true
       echo "boot changed; snapshot left for tick"
       return 0
     fi
@@ -467,9 +469,9 @@ save_unlocked() {
   if [[ $routes_ok == true ]]; then
     cores=(${(f)"$(jq -r '.routes | keys[]' <<< "$inventory")"})
     for core in $cores; do
-      scan=$(scan_core "$inventory" "$core") || continue
+      scan=$(scan_core "$inventory" "$core") || { incomplete=true; continue; }
       known=$(jq -r --arg core "$core" '.machines[$core] // empty' <<< "$old")
-      [[ -n $known && $known != $(jq -r '.boot' <<< "$scan") ]] && continue
+      if [[ -n $known && $known != $(jq -r '.boot' <<< "$scan") ]]; then incomplete=true; continue; fi
       scans+=("$scan")
     done
   fi
@@ -719,7 +721,7 @@ prepare_pending() {
   [[ $saved != "$current" ]] && local_changed=true
 
   for core in ${(f)"$(jq -r '.routes | keys[]' <<< "$inventory")"}; do
-    found=$(probe_core_boot "$inventory" "$core") || continue
+    found=$(probe_core_boot "$inventory" "$core") || { incomplete=true; continue; }
     observed=$(jq -c --arg core "$core" --arg boot "$found" '. + {($core): $boot}' <<< "$observed") || return 1
     old=$(jq -r --arg core "$core" '.machines[$core] // empty' "$snap")
     if [[ -n $old && $old != "$found" ]]; then
@@ -752,22 +754,53 @@ prepare_pending() {
   fi
 }
 
-# The UI waits only until the worker owns the lock and closes its launch pipe.
+tick_unlocked() {
+  local inventory now saved modified
+  hc server status --json >/dev/null 2>&1 || return 2
+
+  inventory=$(machine_inventory) || { inventory='{"aliases":{},"routes":{},"addresses":[]}'; incomplete=true; }
+  ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 2
+  ensure_pending_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 2
+  if [[ -f $pending ]]; then advance_pending_baseline || return 2; fi
+  if [[ -f $snap && ! -f $pending && ${prior_failure:-false} != true ]]; then
+    now=$(boot) || return 2
+    saved=$(jq -r '.boot | tostring' "$snap") || return 2
+    modified=$(stat -f %m "$snap" 2>/dev/null) || modified=0
+    [[ $saved == "$now" && $(( $(date +%s) - modified )) -lt 45 ]] && return 0
+  fi
+  prepare_pending "$inventory" || return 2
+
+  if [[ -f $pending ]]; then
+    restore_pending "$inventory" null || return 2
+  fi
+  save_unlocked >/dev/null
+}
+
+# The scheduled worker holds the mutation lock from its start record through its outcome.
 start_controller() {
   local code
   ensure_state || return 1
   acquire_mutation_lock || {
     code=$?
-    if (( code == 2 )); then
-      [[ $1 == --scheduled ]] && print busy
-      return 2
-    fi
-    return 1
+    if (( code == 2 )) && [[ $1 == worker ]]; then print busy; fi
+    return "$code"
   }
-  if [[ $1 == --scheduled ]]; then
-    print started
-    exec </dev/null >/dev/null 2>&1
+}
+
+run_worker() {
+  local mode=$1 deadline=$2 prior_failure=false incomplete=false outcome=failed
+  [[ $mode == (save|tick) && $deadline == <1-> ]] || return 1
+  start_controller worker || return $?
+  zmodload zsh/datetime || return 1
+  if [[ -f $state/worker.json ]] && ! jq -e '.status == "succeeded"' "$state/worker.json" >/dev/null; then
+    prior_failure=true
   fi
+  write_json "$state/worker.json" "{\"status\":\"running\",\"deadline\":$deadline,\"priorFailure\":$prior_failure}" || return 1
+  print started
+  exec </dev/null >/dev/null 2>&1
+  if "${mode}_unlocked" && [[ $incomplete == false ]]; then outcome=succeeded; fi
+  write_json "$state/worker.json" "{\"status\":\"$outcome\",\"finished\":$EPOCHSECONDS}" || return 1
+  [[ $outcome == succeeded ]]
 }
 
 case "${1:-}" in
@@ -783,12 +816,15 @@ remote-restore)
 schedule)
   unsetopt BG_NICE
   [[ ${2:-} == (save|tick) ]] || exit 2
-  ack=$(zsh "$script" "$2" --scheduled </dev/null 2>/dev/null &!)
+  ack=$(/usr/bin/perl "$script:h/supervise.pl" "$script" "$2" </dev/null 2>/dev/null &!)
   [[ $ack == (started|busy) ]] || exit 1
   print -r -- "$ack"
   ;;
+worker)
+  run_worker "${2:-}" "${3:-}"
+  ;;
 save)
-  start_controller "${2:-}" || exit 1
+  start_controller save || exit 1
   save_unlocked
   ;;
 restore)
@@ -812,28 +848,16 @@ restore)
   fi
   ;;
 tick)
-  start_controller "${2:-}" || {
+  start_controller tick || {
     (( $? == 2 )) && exit 0
     exit 1
   }
-  hc server status --json >/dev/null 2>&1 || exit 0
-
-  inventory=$(machine_inventory) || inventory='{"aliases":{},"routes":{},"addresses":[]}'
-  ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || exit 0
-  ensure_pending_v2 "$(jq -c '.aliases' <<< "$inventory")" || exit 0
-  if [[ -f $pending ]]; then advance_pending_baseline || exit 0; fi
-  if [[ -f $snap && ! -f $pending ]]; then
-    now=$(boot) || exit 0
-    saved=$(jq -r '.boot | tostring' "$snap") || exit 0
-    modified=$(stat -f %m "$snap" 2>/dev/null) || modified=0
-    [[ $saved == "$now" && $(( $(date +%s) - modified )) -lt 45 ]] && exit 0
-  fi
-  prepare_pending "$inventory" || exit 0
-
-  if [[ -f $pending ]]; then
-    restore_pending "$inventory" null || exit 0
-  fi
-  save_unlocked >/dev/null
+  tick_unlocked || {
+    code=$?
+    # Preserve the interactive tick's historical best-effort discovery behavior.
+    (( code == 2 )) && exit 0
+    exit "$code"
+  }
   ;;
 *)
   sed -n '3,7p' "$0"

@@ -8,9 +8,9 @@ The mod shows one line of text, for example `↻ 23 agents saved`. After a reboo
 
 It resumes Claude Code (`claude --resume <id>`), Codex (`codex resume <id>`) and Antigravity (`agy --conversation <id>`). The mod runs on a macOS controller and saves both its local terminals and terminals on configured Linux Herdr cores.
 
-The entry has one mod, `mods/agent-revive`: a small view, `main.js`, and a zsh script, `hc-revive`, that does the work.
+The mod directory contains the status view, the `hc-revive` controller, and `supervise.pl`, which enforces the scheduled worker deadline.
 
-**Before you add it:** the controller needs zsh 5.9 with its `zsh/system` and `zsh/files` modules, `hc` (herdr-core), `ps`, `lsof`, `jq`, `sync`, `sysctl` and BSD `stat`. Each remote Linux core needs `zsh`, `hc`, `ps`, `lsof`, `jq`, and `/proc/sys/kernel/random/boot_id`. The script reads `~/.claude/sessions/` and the first line of open Codex session files to find session IDs. It writes mode-0600 state in `~/.local/state/hc-revive/` on the controller only. It uses existing Herdr machine connections through `hc exec`; recovery happens inside one remote helper that verifies the reached core's permanent ID before using that core's local `hc get` and `hc send`. It does not create a new listener or connection.
+**Before you add it:** the controller needs zsh 5.9 with the `zsh/system`, `zsh/files`, and `zsh/datetime` modules, the system `/usr/bin/perl`, `hc` (herdr-core), `ps`, `lsof`, `jq`, `sync`, `sysctl` and BSD `stat`. Each remote Linux core needs `zsh`, `hc`, `ps`, `lsof`, `jq`, and `/proc/sys/kernel/random/boot_id`. The script reads `~/.claude/sessions/` and the first line of open Codex session files to find session IDs. It writes mode-0600 state in `~/.local/state/hc-revive/` on the controller only. It uses existing Herdr machine connections through `hc exec`; recovery happens inside one remote helper that verifies the reached core's permanent ID before using that core's local `hc get` and `hc send`. It does not create a new listener or connection.
 
 ## Add it
 
@@ -41,7 +41,11 @@ To add it by hand:
 
 There is nothing to do. Once a minute the mod saves the agents that run now. After the controller or a configured Linux core reboots, open Herdr on the controller, or add Herdr to your login items so that it opens by itself. The next tick normally starts within about a minute; completion time scales with the saved batch and unavailable or ambiguous records may instead require manual review. Agent Revive does not power on a computer or launch Herdr by itself.
 
-Clicking the text requests an asynchronous save. The UI waits for the worker to acquire the controller lock or report that another worker already owns it. The next UI refresh reads the published files. Before a planned reboot, run `hc-revive save` directly, wait for completion, and verify the intended machines and sessions in the snapshot. A contended manual save exits unsuccessfully.
+Clicking the text requests an asynchronous save. The worker acquires the controller lock and publishes its deadline before acknowledging startup. Every five seconds the view reads the worker outcome. It reports a failed or timed-out run and flags a completion older than 150 seconds as stale. An incomplete scan can preserve earlier entries for unavailable machines.
+
+The controller supervisor gives each scheduled run one hour. At the deadline it kills the local worker and its helper process group. The next tick can acquire the released lock and continue from the journal. A synced attempt that was in flight needs manual reconciliation. The controller cannot cancel work already accepted by a remote core.
+
+Before a planned reboot, run `hc-revive save` directly, wait for completion, and verify the intended machines and sessions in the snapshot. A contended manual save exits unsuccessfully.
 
 To run it by hand:
 

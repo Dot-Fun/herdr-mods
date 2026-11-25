@@ -17,7 +17,8 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 
 ## How it behaves
 
-- **At start and every 60 seconds** the view requests a local worker and refreshes its counts from the published state. The worker acknowledges startup after acquiring the shared lock, then closes its launch pipes before running any Herdr command. It can finish a large recovery independently of the UI's ten-minute exec limit. Another window receives a busy response while that worker owns the lock. Failed startup is visible in the view.
+- At startup and every 60 seconds the view requests a worker. After acquiring the shared lock, the worker atomically writes its deadline to `worker.json` and acknowledges startup. A second window receives a busy response. The system Perl supervisor starts the worker in a private process group and enforces a one-hour monotonic deadline independently of the UI exec limit. At expiry it kills that group. Synced send markers survive for manual review.
+- Every five seconds the view reads the published worker outcome. Failed discovery, publication, or checkpointing takes precedence over the saved count. A running record past its deadline indicates a timeout. A success record older than 150 seconds indicates stale status. A retry keeps the previous failure visible until completion.
 - **A click on the text** runs `hc-revive save`.
 - **`save`** lists live, kept local terminals (`hc ls --json`, `hc get`). One `ps -axo pid=,tty=,comm=` call gives the tty of each terminal's root process and the processes on it. One `lsof` call for all `codex` and `agy` processes gives their open files. For each terminal, it looks for an agent on the tty:
   - Claude Code: a file `~/.claude/sessions/<pid>.json` whose process is on the tty. The command is `claude --resume <sessionId>` and the folder is the file's `cwd`.
@@ -29,7 +30,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - **`tick`**:
   1. Acquires the same persistent kernel lock as save and restore. Contention skips the scheduled run. Process exit releases the lock.
   2. Checks whether the controller's Herdr core answers `hc server status`.
-  3. Stops when the snapshot is from this boot and less than 45 seconds old.
+  3. Skips a recent snapshot from this boot if there is no pending work. A scheduled retry after failure or interruption bypasses the 45-second window.
   4. Probes each available core boot ID. First observation records a baseline only. A changed boot selects only that core's saved entries.
   5. Merges selected entries into `pending.json` with an atomic mode-0600 rename, calls `sync`, advances and syncs the snapshot baseline, and only then clears the deferred baseline. Applying an uncleared baseline again is idempotent.
   6. Checkpoints each local or remote result independently. Explicit success removes the row, busy retries up to ten available checks, and unavailable terminals retain their retry budget. An ambiguous attempt remains inert for manual reconciliation.
@@ -41,7 +42,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 - **`mods/agent-revive/hc-revive`**: a zsh script with `save`, `restore` and `tick`. `HC_REVIVE_STATE` overrides the state folder, for tests.
 - **Layout**: the `status` block sits in a row with an `agent-revive` block of 190px.
 - **herdr functions**: `exec`, `appHome`, `home`, `readTextFile`, `theme`, `checking`.
-- **Controller programs**: zsh 5.9 with `zsh/system` and `zsh/files`, `hc`, `jq`, `ps`, `lsof`, `sync`, `sysctl`, and BSD `stat`.
+- **Controller programs**: zsh 5.9 with the `zsh/system`, `zsh/files`, and `zsh/datetime` modules, `/usr/bin/perl` with core POSIX and Time::HiRes modules, `hc`, `jq`, `ps`, `lsof`, `sync`, `sysctl`, and BSD `stat`.
 - **Remote programs/data**: `zsh`, `hc`, `jq`, `ps`, `lsof`, and `/proc/sys/kernel/random/boot_id`, in the default remote Herdr session.
 
 ## Watch out
@@ -72,7 +73,7 @@ A block 28px high and 190px wide at the right end of the status bar: `chrome` ba
 
 ## Done when
 
-- `zsh test-hc-revive.zsh` passes the hermetic mock suite for v1 migration, local regression, stable IDs, alias rebinding, duplicate aliases, changed boots, collision replacement, precommit ordering and failure, ambiguous delivery, strict restore checks, control-byte rejection, and mode-0600 state.
+- `zsh test-hc-revive.zsh` passes the hermetic mock suite for v1 migration, local regression, stable IDs, alias rebinding, duplicate aliases, changed boots, collision replacement, precommit ordering and failure, ambiguous delivery, worker deadlines and post-start failures, strict restore checks, control-byte rejection, and mode-0600 state.
 - `herdr-app check mods/agent-revive` passes and `herdr-app status` shows `errors: []` in an authorized deployment validation.
 - `hc-revive save` prints one line for each local or reachable remote agent terminal, and a Codex ID is a root session.
 - A kept terminal that runs Claude, killed with `kill -9` on its root process, comes back as a shell. `hc-revive restore` then resumes the same session, and a second restore reports the terminal as busy.

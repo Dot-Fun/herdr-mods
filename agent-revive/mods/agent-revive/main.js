@@ -94,13 +94,28 @@ function pendingSummary(document) {
   return { ...summary, invalid: false };
 }
 
+function workerStatus(record, now = Date.now() / 1000) {
+  if (record?.status === "running" && Number.isInteger(record.deadline)) {
+    if (now >= record.deadline) return "recovery worker timed out";
+    return record.priorFailure ? "retrying failed recovery" : "recovery in progress";
+  }
+  if (record?.status === "failed") return "recovery worker failed";
+  if (record?.status === "succeeded" && Number.isInteger(record.finished)) {
+    return now - record.finished > 150 ? "recovery status is stale" : null;
+  }
+  return "recovery status unavailable";
+}
+
 export default class AgentRevive extends View {
   init(_props, cx) {
     this.saved = { total: 0, actionable: 0, review: 0, invalid: false, missing: true };
     this.pending = { total: 0, actionable: 0, review: 0, invalid: false };
+    this.health = "checking recovery";
+    this.refreshId = 0;
     if (checking()) return;
     this.tick("tick", cx);
     cx.timer.every(60000, (cx) => this.tick("tick", cx));
+    cx.timer.every(5000, (cx) => this.tick(null, cx));
   }
 
   tick(command, cx) {
@@ -124,12 +139,20 @@ export default class AgentRevive extends View {
           return { total: 0, actionable: 0, review: 0, invalid: true };
         }
       };
-      try {
-        const result = await exec("zsh", [`${appHome()}/mods/agent-revive/hc-revive`, "schedule", command]);
-        this.launchFailed = result.code !== 0 || !["started", "busy"].includes(result.stdout.trim());
-      } catch { this.launchFailed = true; }
-      this.saved = await readSaved();
-      this.pending = await readPending();
+      if (command) {
+        try {
+          const result = await exec("zsh", [`${appHome()}/mods/agent-revive/hc-revive`, "schedule", command]);
+          this.launchFailed = result.code !== 0 || !["started", "busy"].includes(result.stdout.trim());
+        } catch { this.launchFailed = true; }
+      }
+      const refreshId = ++this.refreshId;
+      let record;
+      try { record = JSON.parse(await readTextFile(`${state}/worker.json`)); } catch {}
+      const [saved, pending] = await Promise.all([readSaved(), readPending()]);
+      if (refreshId !== this.refreshId) return;
+      this.saved = saved;
+      this.pending = pending;
+      this.health = workerStatus(record);
       cx.notify();
     });
   }
@@ -140,13 +163,15 @@ export default class AgentRevive extends View {
     const hasPending = actionable > 0 || review > 0 || invalid;
     const savedNeedsReview = this.saved.invalid || this.saved.review > 0;
     const reviewText = review === 1 ? "1 entry needs review" : `${review} entries need review`;
-    const text = this.launchFailed ? "recovery worker failed to start" : actionable > 0
+    const health = this.launchFailed ? "recovery worker failed to start" : this.health;
+    const showHealth = health && (health !== "recovery in progress" || !hasPending);
+    const text = showHealth ? health : actionable > 0
       ? `resuming ${actionable} agent${actionable === 1 ? "" : "s"}${review ? `; ${reviewText}` : "…"}`
       : invalid ? "pending state needs review"
         : review ? reviewText
           : savedStatus(this.saved);
     return h_flex().size_full().px(14).items_center().justify_end().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8)
-      .child(div().id("revive-save").text_color(this.launchFailed || hasPending || savedNeedsReview ? t.working : t.dim).hover((s) => s.text_color(t.foreground))
+      .child(div().id("revive-save").text_color(health || hasPending || savedNeedsReview ? t.working : t.dim).hover((s) => s.text_color(t.foreground))
         .tooltip("Agents that resume after a reboot. Manual-review records are not retried. Click to save now.")
         .on_click((_e, cx) => this.tick("save", cx)).child(`↻ ${text}`));
   }

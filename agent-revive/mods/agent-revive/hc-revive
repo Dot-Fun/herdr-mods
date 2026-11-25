@@ -776,7 +776,7 @@ tick_unlocked() {
   save_unlocked >/dev/null
 }
 
-# The scheduled worker holds the mutation lock from its start record through its outcome.
+# Every controller mutation, including supervisor completion, uses this lock.
 start_controller() {
   local code
   ensure_state || return 1
@@ -788,19 +788,35 @@ start_controller() {
 }
 
 run_worker() {
-  local mode=$1 deadline=$2 prior_failure=false incomplete=false outcome=failed
-  [[ $mode == (save|tick) && $deadline == <1-> ]] || return 1
+  local mode=$1 run=$2 prior_failure=false incomplete=false
+  [[ $mode == (save|tick) ]] && valid_core "$run" || return 1
   start_controller worker || return $?
-  zmodload zsh/datetime || return 1
   if [[ -f $state/worker.json ]] && ! jq -e '.status == "succeeded"' "$state/worker.json" >/dev/null; then
     prior_failure=true
   fi
-  write_json "$state/worker.json" "{\"status\":\"running\",\"deadline\":$deadline,\"priorFailure\":$prior_failure}" || return 1
+  write_json "$state/worker.json" "{\"status\":\"running\",\"run\":\"$run\",\"pid\":$$,\"priorFailure\":$prior_failure}" || return 1
   print started
   exec </dev/null >/dev/null 2>&1
-  if "${mode}_unlocked" && [[ $incomplete == false ]]; then outcome=succeeded; fi
-  write_json "$state/worker.json" "{\"status\":\"$outcome\",\"finished\":$EPOCHSECONDS}" || return 1
-  [[ $outcome == succeeded ]]
+  "${mode}_unlocked" && [[ $incomplete == false ]]
+}
+
+finish_worker() {
+  local run=$1 outcome=$2 observed file=$state/worker.json
+  valid_core "$run" && [[ $outcome == (succeeded|failed|timed_out) ]] || return 1
+  zmodload zsh/datetime || return 1
+  while [[ -f $file ]]; do
+    observed=$(<"$file") || return 1
+    jq -e --arg run "$run" '.status == "running" and .run == $run' <<< "$observed" >/dev/null || return 0
+    if acquire_mutation_lock; then
+      # A newer owner may have published between the read and lock acquisition.
+      [[ $(<"$file") == "$observed" ]] || return 0
+      write_json "$file" "{\"status\":\"$outcome\",\"run\":\"$run\",\"finished\":$EPOCHSECONDS}"
+      return $?
+    else
+      (( $? == 2 )) || return 1
+    fi
+    /bin/sleep 0.1
+  done
 }
 
 case "${1:-}" in
@@ -822,6 +838,9 @@ schedule)
   ;;
 worker)
   run_worker "${2:-}" "${3:-}"
+  ;;
+finish-worker)
+  finish_worker "${2:-}" "${3:-}"
   ;;
 save)
   start_controller save || exit 1

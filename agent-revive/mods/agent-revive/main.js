@@ -95,8 +95,8 @@ function pendingSummary(document) {
 }
 
 function workerStatus(record, now = Date.now() / 1000) {
-  if (record?.status === "running" && Number.isInteger(record.deadline)) {
-    if (now >= record.deadline) return "recovery worker timed out";
+  if (record?.status === "timed_out") return "recovery worker timed out";
+  if (record?.status === "running" && typeof record.run === "string" && core.test(record.run)) {
     return record.priorFailure ? "retrying failed recovery" : "recovery in progress";
   }
   if (record?.status === "failed") return "recovery worker failed";

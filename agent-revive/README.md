@@ -41,9 +41,9 @@ To add it by hand:
 
 There is nothing to do. Once a minute the mod saves the agents that run now. After the controller or a configured Linux core reboots, open Herdr on the controller, or add Herdr to your login items so that it opens by itself. The next tick normally starts within about a minute; completion time scales with the saved batch and unavailable or ambiguous records may instead require manual review. Agent Revive does not power on a computer or launch Herdr by itself.
 
-Clicking the text requests an asynchronous save. The worker acquires the controller lock and publishes its deadline before acknowledging startup. Every five seconds the view reads the worker outcome. It reports a failed or timed-out run and flags a completion older than 150 seconds as stale. An incomplete scan can preserve earlier entries for unavailable machines.
+Clicking the text requests an asynchronous save. The worker acquires the controller lock and publishes its run ID before acknowledging startup. Every five seconds the view reads the worker outcome. It reports a failed or timed-out run and flags a completion older than 150 seconds as stale. An incomplete scan can preserve earlier entries for unavailable machines.
 
-The controller supervisor gives each scheduled run one hour. At the deadline it kills the local worker and its helper process group. The next tick can acquire the released lock and continue from the journal. A synced attempt that was in flight needs manual reconciliation. The controller cannot cancel work already accepted by a remote core.
+The controller supervisor gives each scheduled run one hour. It cleans up the local helper process group on every worker exit and kills the worker at its monotonic deadline. It publishes the observed outcome only while the same run ID is current. The next tick can acquire the released lock and continue from the journal. A synced attempt that was in flight needs manual reconciliation. The controller cannot cancel work already accepted by a remote core.
 
 Before a planned reboot, run `hc-revive save` directly, wait for completion, and verify the intended machines and sessions in the snapshot. A contended manual save exits unsuccessfully.
 

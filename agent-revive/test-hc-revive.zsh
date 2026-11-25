@@ -165,6 +165,17 @@ MOCK
 export ZDOTDIR=$test_root
 cat > "$ZDOTDIR/.zshenv" <<'MOCK'
 zf_mv() { "$HOME/.local/bin/before-publish" "$@" && builtin zf_mv "$@"; }
+# Pause this finalizer after it reads the old record, just before taking the lock.
+if [[ ${1:-} == finish-worker && -f $HC_FIXTURES/pause-finish.${2:-} ]]; then
+  chmod() {
+    print -r -- "$$" > "$HC_FIXTURES/finalizer-waiting"
+    for _ in {1..1000}; do
+      [[ -e $HC_FIXTURES/release-finalizer ]] && break
+      /bin/sleep 0.02
+    done
+    command chmod "$@"
+  }
+fi
 MOCK
 
 cat > "$test_root/mocks/before-publish" <<'MOCK'
@@ -555,12 +566,56 @@ for _ in {1..500}; do
   /bin/sleep 0.02
 done
 if kill -0 "$helper" 2>/dev/null || kill -0 "$child" 2>/dev/null; then fail 'hung helper or descendant survived deadline'; fi
-assert_jq "$HC_REVIVE_STATE/worker.json" '.status == "running" and .deadline <= now' 'unreported expired worker'
+wait_worker timed_out
 assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals[0].delivery.state == "attempting"' 'watchdog lost in-flight attempt'
 assert_eq "$(run_revive schedule tick)" started 'watchdog failed to release lock'
 wait_worker succeeded
 assert_eq "$(wc -l < "$HC_SEND_ATTEMPTS" | tr -d ' ')" 1 'timed-out dispatch replayed'
 pass 'independent watchdog kills a stuck helper and its descendant, releases lock, and preserves attempt'
+
+for scenario in crash superseded; do
+  new_case "worker_$scenario"
+  mkdir -p "$HC_REVIVE_STATE"
+  configure_local_agent
+  jq -n --arg id "$session_1" '{version:2,terminals:[
+    {machine:null,terminal:"t1",cwd:"/work",agent:"codex",session:$id}]}' > "$HC_REVIVE_STATE/pending.json"
+  : > "$HC_FIXTURES/hang.t1"
+  assert_eq "$(run_revive schedule tick)" started 'worker did not acknowledge'
+  for _ in {1..500}; do [[ -s $HC_FIXTURES/hung.t1 ]] && break; /bin/sleep 0.02; done
+  read -r helper child < "$HC_FIXTURES/hung.t1" || fail 'helper never reached send'
+  worker=$(jq -er '.pid | select(. > 1)' "$HC_REVIVE_STATE/worker.json")
+  run=$(jq -er '.run' "$HC_REVIVE_STATE/worker.json")
+  if [[ $scenario == superseded ]]; then : > "$HC_FIXTURES/pause-finish.$run"; fi
+  kill -KILL "$worker"
+
+  if [[ $scenario == superseded ]]; then
+    for _ in {1..500}; do [[ -s $HC_FIXTURES/finalizer-waiting ]] && break; /bin/sleep 0.02; done
+    [[ -s $HC_FIXTURES/finalizer-waiting ]] || fail 'old finalizer never reached lock'
+    finalizer=$(<"$HC_FIXTURES/finalizer-waiting")
+  else
+    wait_worker failed
+    assert_eq "$(jq -r .run "$HC_REVIVE_STATE/worker.json")" "$run" 'crash attributed to wrong run'
+  fi
+  for pid in "$helper" "$child"; do
+    for _ in {1..200}; do kill -0 "$pid" 2>/dev/null || break; /bin/sleep 0.02; done
+    if kill -0 "$pid" 2>/dev/null; then fail 'helper survived worker crash'; fi
+  done
+  assert_jq "$HC_REVIVE_STATE/pending.json" '.terminals[0].delivery.state == "attempting"' 'crash lost attempt marker'
+  assert_eq "$(run_revive schedule tick)" started 'crash held lock'
+  wait_worker succeeded
+  assert_eq "$(wc -l < "$HC_SEND_ATTEMPTS" | tr -d ' ')" 1 'crash replayed send'
+  if [[ $scenario == superseded ]]; then
+    newer=$(<"$HC_REVIVE_STATE/worker.json")
+    [[ $(jq -r .run <<< "$newer") != "$run" ]] || fail 'run ID reused'
+    : > "$HC_FIXTURES/release-finalizer"
+    for _ in {1..500}; do kill -0 "$finalizer" 2>/dev/null || break; /bin/sleep 0.02; done
+    if kill -0 "$finalizer" 2>/dev/null; then fail 'old finalizer did not exit'; fi
+    assert_eq "$(<"$HC_REVIVE_STATE/worker.json")" "$newer" 'old finalizer overwrote a newer run'
+    pass 'an old crash finalizer racing lock acquisition preserves the newer completion'
+  else
+    pass 'post-ack worker SIGKILL promptly publishes failure, kills helpers, releases lock and prevents replay'
+  fi
+done
 
 new_case worker_failure
 configure_local_agent
@@ -588,8 +643,10 @@ const context = {
 vm.runInNewContext(source.slice(source.indexOf("const uuid ="))
   .replace("export default class AgentRevive", "globalThis.AgentRevive = class"), context);
 const status = context.workerStatus;
-if (status({status:"running", deadline:90}, 90) !== "recovery worker timed out"
-    || status({status:"running", deadline:90, priorFailure:true}, 80) !== "retrying failed recovery"
+const running = {status:"running", run:"a".repeat(32)};
+if (status(running, 1e12) !== "recovery in progress" || status(running, 0) !== "recovery in progress"
+    || status({status:"timed_out"}, 0) !== "recovery worker timed out"
+    || status({...running, priorFailure:true}, 80) !== "retrying failed recovery"
     || status({status:"succeeded", finished:50}, 500) !== "recovery status is stale"
     || status({status:"succeeded", finished:50}, 55) !== null) process.exit(1);
 const view = new context.AgentRevive();

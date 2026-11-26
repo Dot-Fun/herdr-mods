@@ -1,111 +1,885 @@
 #!/bin/zsh
-# Resume agents in Herdr desktop (herdr-core) terminals after a reboot. The core only gives a lost terminal a shell.
-# hc-revive save            write the snapshot: each local agent terminal and the command that resumes it
-# hc-revive restore [file]  type the resume command into each saved terminal that is back at its shell
-# hc-revive tick            for the mod's timer: restore once after a reboot, then save
+# Resume agents in Herdr desktop terminals after a reboot, locally and on configured Linux cores.
+# hc-revive save            write a v2 snapshot of the agents running now
+# hc-revive restore [file]  resume saved agents whose kept terminals are back at a root shell
+# hc-revive tick            detect reboots, restore pending agents, then save
+# hc-revive remote-*        internal: identity-checked helpers piped to a remote zsh
 set -u
+umask 077
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-state=${HC_REVIVE_STATE:-~/.local/state/hc-revive}
+
+state=${HC_REVIVE_STATE:-$HOME/.local/state/hc-revive}
 snap=$state/snapshot.json
 pending=$state/pending.json
-mkdir -p $state
-boot() { sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+).*/\1/'; }
-uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+mutation_lock=$state/mutation.lock
+incomplete=false
+script=${0:A}
+uuid_re='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+core_re='[0-9a-f]{32}'
+typeset mutation_lock_fd
 
-# One local live kept terminal per line: address, root pid.
+entry_rules='def actionable:
+    type == "object" and has("machine") and (.legacy != true)
+    and (.delivery == null)
+    and (.machine == null or (((.machine | type) == "string") and (.machine | test("^[0-9a-f]{32}$"))))
+    and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
+    and ((.cwd | type) == "string"
+      and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
+    and (.agent == "codex" or .agent == "claude" or .agent == "agy")
+    and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))
+    and (.tries == null or (((.tries | type) == "number") and .tries >= 0 and .tries == (.tries | floor)));
+  def identity: [.machine, .terminal] | tojson;
+  def quarantine:
+    (reduce (.[] | objects | select(actionable or .delivery != null or .collision == true)) as $e
+      ({}; .[$e | identity] += (if $e | actionable then 1 else 2 end))) as $counts
+    | map(if actionable and $counts[identity] > 1 then . + {legacy: true, collision: true} else . end);'
+
+boot() {
+  if [[ -n ${HC_REVIVE_BOOT:-} ]]; then
+    print -r -- "$HC_REVIVE_BOOT"
+  elif [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    </proc/sys/kernel/random/boot_id
+  else
+    sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+).*/\1/'
+  fi
+}
+
+valid_uuid() { [[ $1 =~ ^${uuid_re}$ ]]; }
+valid_core() { [[ $1 =~ ^${core_re}$ ]]; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+valid_terminal() { [[ $1 =~ ^t[0-9]+$ ]]; }
+valid_cwd() {
+  jq -en --arg cwd "$1" '$cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]") | not' >/dev/null
+}
+
+ensure_state() {
+  mkdir -p "$state" || return 1
+  chmod 700 "$state" || return 1
+}
+
+# save, restore, and tick share one controller-side mutation lock. The lock file is
+# persistent; the fcntl lock itself is released by the kernel when this zsh exits.
+# Omitting zsystem's -e keeps the descriptor out of executed child programs.
+acquire_mutation_lock() {
+  zmodload zsh/system && zmodload -F zsh/files b:zf_mv b:zf_rm || return 1
+  [[ ! -L $mutation_lock && ( ! -e $mutation_lock || -f $mutation_lock ) ]] || return 1
+  : >> "$mutation_lock" || return 1
+  [[ -f $mutation_lock ]] || return 1
+  chmod 600 "$mutation_lock" || return 1
+  zsystem flock -t 0.01 -i 0.01 -f mutation_lock_fd "$mutation_lock" 2>/dev/null
+}
+
+# An alias is only a route. Every remote operation proves that the core reached through it
+# still owns the permanent ID selected from the controller's trusted machine inventory.
+verify_core() {
+  local expected=$1 raw actual
+  valid_core "$expected" || return 1
+  raw=$(hc server status --json 2>/dev/null) || return 1
+  actual=$(jq -rse --arg expected "$expected" '
+    select(length == 1) | .[0]
+    | select(type == "object" and .id == $expected)
+    | .id
+  ' <<< "$raw") || return 1
+  [[ $actual == "$expected" ]]
+}
+
+write_json() {
+  local dest data out
+  dest=$1
+  data=$2
+  out="$state/.${dest:t}.tmp"
+  # Remove any abandoned staging name, then create the private file with umask 077.
+  zf_rm -f "$out" || return 1
+  setopt localoptions noclobber
+  # Publish in the lock-owning shell. A child mv could outlive a killed owner.
+  if print -r -- "$data" > "$out" && zf_mv "$out" "$dest"; then
+    return 0
+  fi
+  zf_rm -f "$out"
+  return 1
+}
+
+# One local live kept terminal per line: terminal ID and root pid.
 terminals() {
-  hc ls --json | jq -r '.terminals[].address | select(contains("/") | not)' | while read -r t; do hc get $t --json; done |
-    jq -r 'select(.state == "live" and .keep) | [.address, .pid] | @tsv'
+  local listing addresses terminal info
+  listing=$(hc ls --json 2>/dev/null) || return 1
+  listing=$(jq -cse '
+    select(length == 1) | .[0]
+    | select(type == "object" and (.terminals | type) == "array")
+    | if (.terminals | all(.[];
+        type == "object" and ((.address | type) == "string")
+        and (.address | test("^([A-Za-z0-9._-]+/)?t[0-9]+$"))))
+        and ((.terminals | map(.address) | unique | length) == (.terminals | length))
+      then . else error("invalid terminal listing") end
+  ' <<< "$listing") || return 1
+  addresses=$(jq -r '.terminals[].address | select(test("^t[0-9]+$"))' <<< "$listing") || return 1
+  for terminal in ${(f)addresses}; do
+    [[ -n $terminal ]] || continue
+    info=$(hc get "$terminal" --json 2>/dev/null) || return 1
+    info=$(jq -cse --arg terminal "$terminal" '
+      select(length == 1) | .[0]
+      | select(type == "object" and .address == $terminal
+          and ((.state | type) == "string") and ((.keep | type) == "boolean"))
+      | if .state == "live" and .keep == true and (((.pid | type) != "number")
+          or .pid <= 0 or .pid != (.pid | floor))
+        then error("live kept terminal has no root pid") else . end
+    ' <<< "$info") || return 1
+    jq -r 'select(.state == "live" and .keep == true) | [.address, .pid] | @tsv' <<< "$info" || return 1
+  done
 }
 
-# One line (address, folder, resume command) for each terminal that runs a known agent.
-# One ps and one lsof do the work.
+# JSON lines: {terminal,cwd,agent,session}. One ps and one lsof cover all known agents.
 agents() {
-  local t pid tty comm kind val f tab=$'\t'
-  typeset -A root tty_of addr_of cwd_of entry
-  local -a others
-  terminals | while IFS=$'\t' read -r t pid; do root[$t]=$pid; done
-  (( $#root )) || return 0
-  # One ps for everything: each ps call costs a third of a second here, however few processes it names.
-  ps -axo pid=,tty=,comm= | while read -r pid tty comm; do
-    [[ $tty == '??' ]] && continue
+  local rows processes lsof_raw lsof_rows terminal pid tty comm kind value file record cwd session
+  typeset -A root tty_of terminal_of cwd_of codex_file agy_id
+  local -a others files
+
+  rows=$(terminals) || return 1
+  while IFS=$'\t' read -r terminal pid; do
+    [[ -n $terminal && -n $pid ]] && root[$terminal]=$pid
+  done <<< "$rows"
+  (( ${#root} )) || return 0
+
+  processes=$(ps -axo pid=,tty=,comm=) || return 1
+  while read -r pid tty comm; do
+    [[ -n $pid && $tty != '??' ]] || continue
     tty_of[$pid]=$tty
-    [[ ${comm:t} == (codex|agy)* ]] && others+=($pid)
+    [[ ${comm:t} == (codex|agy)* ]] && others+=("$pid")
+  done <<< "$processes"
+  for terminal pid in ${(kv)root}; do
+    [[ -n ${tty_of[$pid]:-} ]] && terminal_of[${tty_of[$pid]}]=$terminal
   done
-  for t pid in ${(kv)root}; do [[ -n ${tty_of[$pid]:-} ]] && addr_of[${tty_of[$pid]}]=$t; done
-  (( $#addr_of )) || return 0
-  # Codex holds its rollout files open, and agy its conversation folder. The open rollouts are often
-  # sub-agent threads; session_id in the first line names the root.
-  (( $#others )) && lsof -a -p ${(j:,:)others} -d cwd,0-9999 -Fpfn 2>/dev/null | awk '
-    /^p/ { pid = substr($0, 2) } /^f/ { fd = substr($0, 2) }
-    /^n/ { n = substr($0, 2)
-      if (fd == "cwd") print pid "\tcwd\t" n
-      else if (n ~ /\/rollout-.*\.jsonl$/) print pid "\tcodex\t" n
-      else if (match(n, /antigravity-cli\/brain\/[0-9a-f-]+/)) print pid "\tagy\t" substr(n, RSTART + 22, RLENGTH - 22) }' |
-  while IFS=$'\t' read -r pid kind val; do
-    t=${addr_of[${tty_of[$pid]}]:-}
-    [[ -n $t ]] || continue
-    [[ $kind == cwd ]] && { cwd_of[$pid]=$val; continue; }
-    [[ -n ${entry[$t]:-} ]] && continue
-    [[ $kind == codex ]] && entry[$t]=$(head -1 $val | jq -r '[.payload.cwd, "codex resume \(.payload.session_id)"] | @tsv')
-    [[ $kind == agy ]] && entry[$t]="${cwd_of[$pid]}${tab}agy --conversation $val"
-  done
-  # Claude writes one file per live process, and wins over a codex or agy that it started.
-  local -a files=(~/.claude/sessions/*.json(N))
-  (( $#files )) && jq -r '[input_filename, .cwd, "claude --resume \(.sessionId)"] | @tsv' $files |
-  while IFS=$'\t' read -r f val kind; do
-    t=${addr_of[${tty_of[${f:t:r}]:-none}]:-}
-    [[ -n $t ]] && entry[$t]="$val$tab$kind"
-  done
-  for t in ${(k)entry}; do [[ -n ${entry[$t]} ]] && print -r -- "$t$tab${entry[$t]}"; done
-}
+  (( ${#terminal_of} )) || return 0
 
-save() {
-  local out=$state/.snapshot.$$
-  local entries=$(agents)
-  # An empty list right after a reboot must not replace the snapshot that restore still needs.
-  [[ -n $entries ]] || { echo "no agent terminals found; snapshot left as it was"; return 0; }
-  [[ -f $snap ]] || echo '{"terminals": []}' > $snap
-  # A shutdown stops the agents one by one, so an agent that is gone stays saved for 5 minutes.
-  jq -Rs --argjson boot $(boot) --argjson now $(date +%s) --slurpfile old $snap '
-    [split("\n")[] | select(length > 0) | split("\t") | {address: .[0], cwd: .[1], cmd: .[2], seen: $now}] as $new
-    | {boot: $boot, terminals: ($new + [$old[0].terminals[]
-        | select((.seen // 0) > $now - 300 and (.address as $a | $new | all(.address != $a)))])}' <<<$entries > $out && mv $out $snap
-  jq -r '.terminals[] | [.address, .cmd, .cwd] | @tsv' $snap
-}
+  if (( ${#others} )); then
+    lsof_raw=$(lsof -a -p ${(j:,:)others} -d cwd,0-9999 -Fpfn 2>/dev/null) || return 1
+    lsof_rows=$(print -r -- "$lsof_raw" | awk '
+      /^p/ { pid = substr($0, 2) } /^f/ { fd = substr($0, 2) }
+      /^n/ { n = substr($0, 2)
+        if (fd == "cwd") print pid "\tcwd\t" n
+        else if (n ~ /\/rollout-.*\.jsonl$/) print pid "\tcodex\t" n
+        else if (match(n, /antigravity-cli\/brain\/[0-9A-Fa-f-]+/))
+          print pid "\tagy\t" substr(n, RSTART + 22, RLENGTH - 22) }') || return 1
+    while IFS=$'\t' read -r pid kind value; do
+      [[ -n $pid && -n $kind ]] || continue
+      case $kind in
+      cwd) cwd_of[$pid]=$value ;;
+      codex) [[ -z ${codex_file[$pid]:-} ]] && codex_file[$pid]=$value ;;
+      agy) [[ -z ${agy_id[$pid]:-} ]] && agy_id[$pid]=$value ;;
+      esac
+    done <<< "$lsof_rows"
+  fi
 
-# Prints the entries it could not revive yet (still pending), as JSON lines.
-restore() {
-  local file=${1:-$snap}
-  jq -c '.terminals[]' $file | while read -r e; do
-    t=$(jq -r .address <<<$e)
-    info=$(hc get $t --json 2>/dev/null)
-    if [[ $(jq -r '.state == "live" and (.foreground == null or .foreground.pid == .pid)' <<<$info 2>/dev/null) == true ]]; then
-      hc send $t "$(jq -r '"cd \(.cwd | @sh) && \(.cmd)"' <<<$e)" >/dev/null && { echo "revived $t" >&2; sleep 0.1; continue; }
+  for pid in $others; do
+    terminal=${terminal_of[${tty_of[$pid]:-none}]:-}
+    [[ -n $terminal ]] || continue
+    if [[ -n ${codex_file[$pid]:-} ]]; then
+      record=$(head -n 1 "${codex_file[$pid]}" 2>/dev/null) || continue
+      cwd=$(jq -er '.payload.cwd | select(type == "string")' <<< "$record" 2>/dev/null) || continue
+      session=$(jq -er '.payload.session_id | select(type == "string")' <<< "$record" 2>/dev/null) || continue
+      if valid_uuid "$session" && valid_cwd "$cwd"; then
+        jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+          '{terminal: $terminal, cwd: $cwd, agent: "codex", session: $session}' || return 1
+        continue
+      fi
     fi
-    [[ $(jq -r '.state // "gone"' <<<$info 2>/dev/null) == live ]] && echo "skip $t: busy" >&2 || echo "skip $t: not live" >&2
-    echo $e
+    cwd=${cwd_of[$pid]:-}
+    session=${agy_id[$pid]:-}
+    if [[ -n $cwd ]] && valid_uuid "$session" && valid_cwd "$cwd"; then
+      jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+        '{terminal: $terminal, cwd: $cwd, agent: "agy", session: $session}' || return 1
+    fi
+  done
+
+  files=(~/.claude/sessions/*.json(N))
+  for file in $files; do
+    pid=${file:t:r}
+    [[ $pid == <-> ]] || continue
+    terminal=${terminal_of[${tty_of[$pid]:-none}]:-}
+    [[ -n $terminal ]] || continue
+    cwd=$(jq -er '.cwd | select(type == "string")' "$file" 2>/dev/null) || continue
+    session=$(jq -er '.sessionId | select(type == "string")' "$file" 2>/dev/null) || continue
+    if valid_uuid "$session" && valid_cwd "$cwd"; then
+      jq -cn --arg terminal "$terminal" --arg cwd "$cwd" --arg session "$session" \
+        '{terminal: $terminal, cwd: $cwd, agent: "claude", session: $session}' || return 1
+    fi
+  done
+
+  return 0
+}
+
+discover_agents() {
+  local lines
+  lines=$(agents) || return 1
+  if [[ -n $lines ]]; then
+    print -r -- "$lines" | jq -cs 'unique'
+  else
+    print '[]'
+  fi
+}
+
+# This is the only mode run on a remote Linux core. It creates no state there.
+scan_here() {
+  local expected=$1 current found command
+  for command in hc jq ps lsof; do command -v "$command" >/dev/null || return 1; done
+  verify_core "$expected" || return 1
+  current=$(boot) || return 1
+  valid_uuid "$current" || return 1
+  found=$(discover_agents) || return 1
+  jq -cn --arg core_id "$expected" --arg boot "$current" --argjson terminals "$found" \
+    '{core_id: $core_id, boot: $boot, terminals: $terminals}'
+}
+
+remote_boot() {
+  local expected=$1 current command
+  for command in hc jq; do command -v "$command" >/dev/null || return 1; done
+  verify_core "$expected" || return 1
+  [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
+  current=$(</proc/sys/kernel/random/boot_id) || return 1
+  valid_uuid "$current" || return 1
+  jq -cn --arg core_id "$expected" --arg boot "$current" '{core_id: $core_id, boot: $boot}'
+}
+
+# Current permanent core IDs, their usable aliases, and terminal routes advertised by hc.
+machine_inventory() {
+  local machines listing
+  machines=$(hc machine ls --json 2>/dev/null) || return 1
+  listing=$(hc ls --json 2>/dev/null) || return 1
+  jq -cne --argjson inventory "$machines" --argjson listing "$listing" '
+    ($inventory | select(type == "object") | .machines) as $machines
+    | ($listing | select(type == "object") | .terminals) as $terminals
+    | if ($machines | type) != "array" or ($terminals | type) != "array"
+      then error("invalid hc inventory") else . end
+    | if ($terminals | all(.[]; type == "object" and ((.address | type) == "string")
+        and (.address | test("^([A-Za-z0-9._-]+/)?t[0-9]+$"))))
+      then . else error("invalid terminal inventory") end
+    | [$terminals[]?.address
+        | select(type == "string" and test("^[A-Za-z0-9._-]+/t[0-9]+$"))] as $addresses
+    | [$addresses[] | split("/")[0]] | unique as $advertised
+    | [$machines[] | select(.temporary != true)] as $configured
+    | if ($configured | any(.[];
+        ((.id | type) != "string" or (.id | test("^[0-9a-f]{32}$") | not))
+        or ((.name | type) != "string" or (.name | test("^[A-Za-z0-9._-]+$") | not))))
+      then error("invalid permanent machine identity") else . end
+    | if ($configured | group_by(.name) | any(.[]; (map(.id) | unique | length) != 1))
+      then error("machine alias maps to multiple core IDs") else . end
+    | (reduce ($configured | group_by(.id)[]) as $group ({};
+        .[$group[0].id] = ($group | sort_by(.name) | map(.name) | unique))) as $aliases
+    | [$configured[] | .name as $name | select($advertised | index($name))
+        | {id, name, rank: (if .state == "connected" then 0 else 1 end)}] as $eligible
+    | (reduce ($eligible | group_by(.id)[]) as $group ({};
+        .[$group[0].id] = ($group | sort_by(.rank, .name)
+          | reduce .[] as $machine ([];
+              if index($machine.name) then . else . + [$machine.name] end)))) as $routes
+    | {aliases: $aliases, routes: $routes, addresses: ($addresses | unique | sort)}
+  '
+}
+
+scan_alias() {
+  local alias=$1 expected=$2 raw
+  valid_name "$alias" && valid_core "$expected" || return 1
+  raw=$(hc exec -i --on "$alias" --timeout 5 zsh -s -- remote-scan "$expected" < "$script" 2>/dev/null) || return 1
+  jq -cse --arg expected "$expected" --arg uuid "$uuid_re" '
+    select(length == 1) | .[0]
+    | select(type == "object" and .core_id == $expected)
+    | select((.boot | type) == "string" and (.boot | test("^" + $uuid + "$")))
+    | select((.terminals | type) == "array")
+    | select(.terminals | all(.[];
+        type == "object"
+        and ((.terminal | type) == "string" and (.terminal | test("^t[0-9]+$")))
+        and ((.cwd | type) == "string"
+          and ((.cwd | test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]")) | not))
+        and (.agent == "codex" or .agent == "claude" or .agent == "agy")
+        and ((.session | type) == "string" and (.session | test("^" + $uuid + "$")))))
+    | {boot, terminals: [.terminals[] | {terminal, cwd, agent, session}]}
+  ' <<< "$raw"
+}
+
+scan_core() {
+  local inventory=$1 core=$2 alias result
+  valid_core "$core" || return 1
+  for alias in ${(f)"$(jq -r --arg core "$core" '.routes[$core][]?' <<< "$inventory")"}; do
+    result=$(scan_alias "$alias" "$core") || continue
+    jq -c --arg machine "$core" '. + {machine: $machine}' <<< "$result"
+    return
+  done
+  return 1
+}
+
+probe_core_boot() {
+  local inventory=$1 core=$2 alias raw current
+  valid_core "$core" || return 1
+  for alias in ${(f)"$(jq -r --arg core "$core" '.routes[$core][]?' <<< "$inventory")"}; do
+    raw=$(hc exec -i --on "$alias" --timeout 5 zsh -s -- remote-boot "$core" < "$script" 2>/dev/null) || continue
+    current=$(jq -rse --arg core "$core" --arg uuid "$uuid_re" '
+      select(length == 1) | .[0]
+      | select(type == "object" and .core_id == $core
+          and ((.boot | type) == "string") and (.boot | test("^" + $uuid + "$")))
+      | .boot
+    ' <<< "$raw") || continue
+    print -r -- "$current"
+    return
+  done
+  return 1
+}
+
+# Convert original {address,cwd,cmd,seen} entries to stable v2 identities.
+# Entries that cannot be mapped or validated remain inert evidence and are never sent or aged.
+normalize_file() {
+  local file=$1 aliases=$2 normalized current
+  normalized=$(jq -ce --arg uuid "$uuid_re" --argjson aliases "$aliases" "$entry_rules"'
+    def safe_cwd:
+      type == "string"
+      and (test("[\\x{0000}-\\x{001F}\\x{007F}-\\x{009F}]") | not);
+    def command_parts:
+      if ((.agent == "codex" or .agent == "claude" or .agent == "agy")
+          and ((.session | type) == "string") and (.session | test("^" + $uuid + "$")))
+      then {agent, session}
+      elif ((.cmd | type) == "string"
+          and (.cmd | test("^(codex resume|claude --resume|agy --conversation) " + $uuid + "$")))
+      then (.cmd | capture("^(?<prefix>codex resume|claude --resume|agy --conversation) (?<session>" + $uuid + ")$")
+        | {agent: (if .prefix == "codex resume" then "codex"
+            elif .prefix == "claude --resume" then "claude" else "agy" end), session})
+      else null end;
+    def place:
+      if (has("machine") and .machine == null
+          and ((.terminal | type) == "string") and (.terminal | test("^t[0-9]+$")))
+      then {machine: null, terminal}
+      elif (has("machine") and ((.machine | type) == "string")
+          and (.machine | test("^[0-9a-f]{32}$"))
+          and ((.terminal | type) == "string") and (.terminal | test("^t[0-9]+$")))
+      then {machine, terminal}
+      elif ((.address | type) == "string" and (.address | test("^t[0-9]+$")))
+      then {machine: null, terminal: .address}
+      else null end;
+    if type != "object" or ((.version // 1) != 1 and .version != 2) or (.terminals | type) != "array"
+        or ((.machines // {}) | type) != "object" or (.boot == null)
+      then error("invalid snapshot") else . end
+    | (.machines // {}) as $machines
+    | if ($machines | to_entries | all(.[];
+          (.key | test("^[0-9a-f]{32}$")) and ((.value | type) == "string")
+          and (.value | test("^" + $uuid + "$"))))
+      then . else error("invalid machine baselines") end
+    | . as $root
+    | ($root + {version: 2, boot: $root.boot, machines: $machines, terminals: [
+        $root.terminals[]
+        | . as $entry | ($entry | command_parts) as $command | ($entry | place) as $place
+        | ($entry.tries // $root.tries // null) as $tries
+        | ($entry.cwd | safe_cwd) as $cwd_ok
+        | ($tries == null or (($tries | type) == "number"
+            and $tries >= 0 and $tries == ($tries | floor))) as $tries_ok
+        | if ($command == null or $place == null or ($cwd_ok | not) or ($tries_ok | not)
+            or $entry.legacy == true or $entry.delivery != null)
+          then ($entry + {legacy: true} | del(.migration))
+          else {machine: $place.machine, terminal: $place.terminal, cwd: $entry.cwd,
+            agent: $command.agent, session: $command.session,
+            seen: (if ($entry.seen | type) == "number" then $entry.seen else 0 end)}
+            + (if $tries == null then {} else {tries: $tries} end) end
+      ]}) | .terminals |= quarantine
+  ' "$file") || return 1
+  current=$(jq -c '.' "$file") || return 1
+  if [[ $normalized == "$current" ]]; then
+    chmod 600 "$file"
+  else
+    write_json "$file" "$normalized"
+  fi
+}
+
+quarantine_file() {
+  local file=$1 updated
+  updated=$(jq -cse --arg uuid "$uuid_re" "$entry_rules"'
+    select(length == 1) | .[0] | . as $old | .terminals |= quarantine
+    | if . == $old then "" else . end' "$file") || return 1
+  [[ $updated == '""' ]] || write_json "$file" "$updated"
+}
+
+ensure_snapshot_v2() {
+  local aliases=$1 version
+  [[ -f $snap ]] || return 0
+  chmod 600 "$snap" || return 1
+  version=$(jq -rse 'select(length == 1) | .[0] | .version // 1' "$snap" 2>/dev/null) || return 1
+  if [[ $version != 2 || $(jq -r '[.terminals[]? | objects | select(.migration == true)] | length' "$snap") != 0 ]]; then
+    normalize_file "$snap" "$aliases" || return 1
+  else
+    jq -e --arg uuid "$uuid_re" '
+      type == "object" and (.boot != null) and (.version == 2)
+      and ((.machines | type) == "object") and ((.terminals | type) == "array")
+      and (.machines | to_entries | all(.[]; (.key | test("^[0-9a-f]{32}$"))
+        and ((.value | type) == "string") and (.value | test("^" + $uuid + "$"))))
+    ' "$snap" >/dev/null || return 1
+    quarantine_file "$snap" || return 1
+  fi
+}
+
+ensure_pending_v2() {
+  local aliases=$1 version
+  [[ -f $pending ]] || return 0
+  chmod 600 "$pending" || return 1
+  version=$(jq -rse 'select(length == 1) | .[0] | .version // 1' "$pending" 2>/dev/null) || return 1
+  if [[ $version != 2 || $(jq -r '[.terminals[]? | objects | select(.migration == true)] | length' "$pending") != 0 ]]; then
+    normalize_file "$pending" "$aliases" || return 1
+  fi
+  jq -e --arg uuid "$uuid_re" '
+    type == "object" and .version == 2 and (.terminals | type) == "array"
+    and (.boot == null or ((.boot | type) == "string") or ((.boot | type) == "number"))
+    and (.machines == null or (
+      ((.machines | type) == "object")
+      and (.machines | to_entries | all(.[];
+        (.key | test("^[0-9a-f]{32}$")) and ((.value | type) == "string")
+        and (.value | test("^" + $uuid + "$"))))))
+    and (.tries == null or (((.tries | type) == "number")
+      and .tries >= 0 and .tries == (.tries | floor)))
+    and (
+      .baseline == null
+      or (
+        (.baseline | type) == "object"
+        and (.baseline.boot == null or ((.baseline.boot | type) == "string")
+          or ((.baseline.boot | type) == "number"))
+        and (((.baseline.machines // {}) | type) == "object")
+        and ((.baseline.machines // {}) | to_entries | all(.[];
+          (.key | test("^[0-9a-f]{32}$")) and ((.value | type) == "string")
+          and (.value | test("^" + $uuid + "$"))))
+      )
+    )
+  ' "$pending" >/dev/null || return 1
+  quarantine_file "$pending"
+}
+
+save_unlocked() {
+  ensure_state || return 1
+  local current old_boot inventory routes_ok=true local_found old scans_json observations output core scan known
+  local -a scans cores
+
+  current=$(boot) || return 1
+  inventory=$(machine_inventory) || { inventory='{"aliases":{},"routes":{},"addresses":[]}'; routes_ok=false; incomplete=true; }
+  ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 1
+  if [[ -f $snap ]]; then
+    old_boot=$(jq -r '.boot | tostring' "$snap") || return 1
+    if [[ $old_boot != "$current" ]]; then
+      incomplete=true
+      echo "boot changed; snapshot left for tick"
+      return 0
+    fi
+    old=$(jq -c '.' "$snap") || return 1
+  else
+    old=$(jq -cn --arg boot "$current" '{version: 2, boot: $boot, machines: {}, terminals: []}')
+  fi
+
+  local_found=$(discover_agents) || return 1
+  if [[ $routes_ok == true ]]; then
+    cores=(${(f)"$(jq -r '.routes | keys[]' <<< "$inventory")"})
+    for core in $cores; do
+      scan=$(scan_core "$inventory" "$core") || { incomplete=true; continue; }
+      known=$(jq -r --arg core "$core" '.machines[$core] // empty' <<< "$old")
+      if [[ -n $known && $known != $(jq -r '.boot' <<< "$scan") ]]; then incomplete=true; continue; fi
+      scans+=("$scan")
+    done
+  fi
+  if (( ${#scans} )); then
+    scans_json=$(printf '%s\n' "${scans[@]}" | jq -cs '.') || return 1
+  else
+    scans_json='[]'
+  fi
+  observations=$(jq -nr --argjson local "$local_found" --argjson scans "$scans_json" \
+    '($local | length) + ($scans | length)') || return 1
+  if (( observations == 0 )); then
+    echo "no agent terminals found; snapshot left as it was"
+    return 0
+  fi
+
+  output=$(jq -cn --arg boot "$current" --argjson now "$(date +%s)" --argjson old "$old" \
+    --argjson local "$local_found" --argjson scans "$scans_json" --arg uuid "$uuid_re" "$entry_rules"'
+    (reduce ($old.terminals[] | objects | select(.collision == true or .delivery != null)) as $row
+      ({}; .[$row | identity] = true)) as $blocked
+    | ([$local[] | . + {machine: null, seen: $now}]
+      + [$scans[] as $scan | $scan.terminals[] | . + {machine: $scan.machine, seen: $now}] | map(select($blocked[identity] != true))) as $new
+    | ($scans | map(select(.terminals | group_by(.terminal) | all(length == 1)) | .machine)) as $successful
+    | (reduce $scans[] as $scan ($old.machines; .[$scan.machine] = $scan.boot)) as $machines
+    | [$old.terminals[]?
+        | . as $prior
+        | select(if (actionable | not) then true
+            else (.machine // "local") as $machine | .terminal as $terminal
+              | ($new | all((.machine // "local") != $machine or .terminal != $terminal)) end)
+        | select(if (actionable | not) then true
+            elif .machine == null then (($local | length) == 0 or ((.seen // 0) > $now - 300))
+            elif ($successful | index($prior.machine)) == null then true
+            else ((.seen // 0) > $now - 300) end)] as $kept
+    | {version: 2, boot: $boot, machines: $machines, terminals: ($new + $kept | quarantine)}
+  ') || return 1
+  write_json "$snap" "$output" || return 1
+  command sync >/dev/null 2>&1 || return 1
+  jq -r --arg uuid "$uuid_re" "$entry_rules"'.machines as $cores | .terminals[] | select(actionable)
+    | select(.machine == null or (.machine as $id | $cores | has($id)))
+    | [((.machine // "local") + "/" + .terminal),
+      (if .agent == "codex" then "codex resume " + .session
+       elif .agent == "claude" then "claude --resume " + .session
+       else "agy --conversation " + .session end), .cwd] | @tsv' "$snap"
+}
+
+valid_entry() {
+  jq -e --arg uuid "$uuid_re" "$entry_rules"'actionable' >/dev/null
+}
+
+entry_command() {
+  local entry=$1 agent session
+  valid_entry <<< "$entry" || return 1
+  agent=$(jq -r '.agent' <<< "$entry")
+  session=$(jq -r '.session' <<< "$entry")
+  case $agent in
+  codex) print -r -- "codex resume $session" ;;
+  claude) print -r -- "claude --resume $session" ;;
+  agy) print -r -- "agy --conversation $session" ;;
+  *) return 1 ;;
+  esac
+}
+
+inspect_terminal() {
+  local route=$1 raw
+  [[ $route =~ ^([A-Za-z0-9._-]+/)?t[0-9]+$ ]] || return 1
+  raw=$(hc get "$route" --json 2>/dev/null) || return 1
+  jq -rse --arg route "$route" '
+    select(length == 1) | .[0]
+    | select(type == "object" and .address == $route and .state == "live" and .keep == true
+      and ((.pid | type) == "number") and .pid > 0 and .pid == (.pid | floor)
+      and (.foreground == null or ((.foreground | type) == "object"
+        and ((.foreground.pid | type) == "number") and .foreground.pid > 0
+        and .foreground.pid == (.foreground.pid | floor))))
+    | if .foreground == null or .foreground.pid == .pid then "shell" else "busy" end
+  ' <<< "$raw"
+}
+
+# This entire helper runs inside one hc exec process. It verifies the reached core before
+# resolving the bare local terminal and sending, so a reassigned controller alias cannot
+# receive another core's resume command.
+remote_restore() {
+  local expected=$1 terminal=$2 cwd=$3 agent=$4 session=$5 entry command terminal_status line
+  for command in hc jq; do command -v "$command" >/dev/null || return 1; done
+  entry=$(jq -cn --arg machine "$expected" --arg terminal "$terminal" --arg cwd "$cwd" \
+    --arg agent "$agent" --arg session "$session" \
+    '{machine: $machine, terminal: $terminal, cwd: $cwd, agent: $agent, session: $session}') || return 1
+  valid_entry <<< "$entry" || return 1
+  if ! verify_core "$expected"; then
+    jq -cn --arg core_id "$expected" '{core_id: $core_id, status: "identity_mismatch"}'
+    return 0
+  fi
+  terminal_status=$(inspect_terminal "$terminal") || {
+    jq -cn --arg core_id "$expected" '{core_id: $core_id, status: "unavailable"}'
+    return 0
+  }
+  if [[ $terminal_status == busy ]]; then
+    jq -cn --arg core_id "$expected" '{core_id: $core_id, status: "busy"}'
+    return 0
+  fi
+  command=$(entry_command "$entry") || return 1
+  line=$(jq -nr --arg cwd "$cwd" --arg command "$command" '"cd \($cwd | @sh) && \($command)"') || return 1
+  if hc send "$terminal" "$line" >/dev/null 2>&1; then
+    jq -cn --arg core_id "$expected" '{core_id: $core_id, status: "sent"}'
+  else
+    jq -cn --arg core_id "$expected" '{core_id: $core_id, status: "send_failed"}'
+  fi
+}
+
+restore_alias() {
+  local alias=$1 expected=$2 terminal=$3 cwd=$4 agent=$5 session=$6 raw
+  valid_name "$alias" && valid_core "$expected" && valid_terminal "$terminal" && valid_cwd "$cwd" \
+    && valid_uuid "$session" || return 1
+  [[ $agent == (codex|claude|agy) ]] || return 1
+  raw=$(hc exec -i --on "$alias" --timeout 10 zsh -s -- remote-restore \
+    "$expected" "$terminal" "$cwd" "$agent" "$session" < "$script" 2>/dev/null) || return 1
+  jq -rse --arg expected "$expected" '
+    select(length == 1) | .[0]
+    | select(type == "object" and .core_id == $expected
+        and (.status == "sent" or .status == "busy" or .status == "unavailable"
+          or .status == "identity_mismatch" or .status == "send_failed"))
+    | .status
+  ' <<< "$raw"
+}
+
+# Compare the whole row so stale or ambiguous state cannot authorize a dispatch.
+replace_pending_entry() {
+  local before=$1 after=$2 updated
+  updated=$(jq -ce --argjson before "$before" --argjson after "$after" '
+    if ([.terminals[] | select(. == $before)] | length) != 1 then error("pending row changed")
+    else .terminals |= map(if . != $before then . elif $after == null then empty else $after end)
+    | .tries = ([.terminals[] | objects | .tries | numbers | select(. >= 0 and . == floor)] | max // 0)
+    end' "$pending") || return 1
+  write_json "$pending" "$updated"
+}
+
+restore_pending() {
+  local inventory=$1 selection=$2 entries entry machine terminal cwd agent session alias
+  local outcome marked replacement command line tries
+  [[ -f $pending ]] || return 0
+  entries=$(jq -c --arg uuid "$uuid_re" --argjson selection "$selection" "$entry_rules"'
+    .terminals[] | select(actionable) | . as $entry
+    | select($selection == null or any($selection[];
+        .machine == $entry.machine and .terminal == $entry.terminal
+        and .cwd == $entry.cwd and .agent == $entry.agent and .session == $entry.session))' "$pending") || return 1
+  while IFS= read -r entry; do
+    [[ -n $entry ]] || continue
+    machine=$(jq -r '.machine // empty' <<< "$entry") || return 1
+    terminal=$(jq -r '.terminal' <<< "$entry") || return 1
+    cwd=$(jq -r '.cwd' <<< "$entry") || return 1
+    alias=local
+    if [[ -n $machine ]]; then
+      alias=$(jq -r --arg machine "$machine" --arg terminal "$terminal" '
+        .addresses as $addresses
+        | first(.routes[$machine][]? as $alias
+            | select($addresses | index($alias + "/" + $terminal)) | $alias) // empty
+      ' <<< "$inventory") || return 1
+      [[ -n $alias ]] || continue
+      agent=$(jq -r '.agent' <<< "$entry") || return 1
+      session=$(jq -r '.session' <<< "$entry") || return 1
+    else
+      command=$(entry_command "$entry") || return 1
+      line=$(jq -nr --arg cwd "$cwd" --arg command "$command" '"cd \($cwd | @sh) && \($command)"') || return 1
+    fi
+    marked=$(jq -c --arg route "$alias" --arg attempt "$(date +%s)-$$-$RANDOM" '
+      .delivery = {state:"attempting", route:$route, attempt:$attempt}' <<< "$entry") || return 1
+    replace_pending_entry "$entry" "$marked" || return 1
+    command sync >/dev/null 2>&1 || return 1
+    if [[ -n $machine ]]; then
+      outcome=$(restore_alias "$alias" "$machine" "$terminal" "$cwd" "$agent" "$session") || outcome=send_failed
+    else
+      outcome=$(inspect_terminal "$terminal") || outcome=unavailable
+      if [[ $outcome == shell ]]; then
+        if hc send "$terminal" "$line" >/dev/null; then outcome=sent; else outcome=send_failed; fi
+      fi
+    fi
+    case $outcome in
+    sent) replacement=null; echo "revived $alias/$terminal" >&2 ;;
+    busy)
+      tries=$(jq -r '.tries // 0' <<< "$entry") || return 1
+      if (( tries < 9 )); then
+        replacement=$(jq -c --argjson tries "$((tries + 1))" '.tries = $tries' <<< "$entry") || return 1
+      else
+        replacement=null
+        echo "gave up $terminal after 10 available tries" >&2
+      fi ;;
+    unavailable|identity_mismatch) replacement=$entry ;;
+    *) replacement=$(jq -c '.delivery.state = "delivery_unknown"' <<< "$marked") || return 1 ;;
+    esac
+    replace_pending_entry "$marked" "$replacement" || return 1
+  done <<< "$entries"
+  if jq -e '.terminals == []' "$pending" >/dev/null; then zf_rm -f "$pending" || return 1; fi
+  return 0
+}
+
+advance_pending_baseline() {
+  local baseline updated cleared
+  [[ -f $pending ]] || return 0
+  baseline=$(jq -ce '.baseline // {machines: {}}' "$pending" 2>/dev/null) || return 1
+  [[ $(jq -r '(.boot != null) or ((.machines // {}) | length > 0)' <<< "$baseline") == true ]] || return 0
+  updated=$(jq -ce --argjson baseline "$baseline" '
+    .boot = ($baseline.boot // .boot)
+    | .machines = ((.machines // {}) * ($baseline.machines // {}))
+  ' "$snap") || return 1
+  # The pending rename must reach durable storage before a reboot baseline can advance.
+  # sync is intentionally limited to transitions carrying a deferred baseline.
+  command sync >/dev/null 2>&1 || return 1
+  write_json "$snap" "$updated" || return 1
+  # Do not clear the deferred baseline until the snapshot rename is also ordered
+  # to storage. Reapplying an uncleared baseline is intentionally idempotent.
+  command sync >/dev/null 2>&1 || return 1
+  cleared=$(jq -ce '.baseline = {machines: {}}' "$pending") || return 1
+  write_json "$pending" "$cleared"
+}
+
+merge_pending() {
+  local additions=$1 baseline=$2 manual=${3:-false} existing merged
+  if [[ -f $pending ]]; then
+    existing=$(jq -ce 'select(type == "object" and (.terminals | type) == "array")
+      | .baseline = (.baseline // {machines: {}})' "$pending") || return 1
+  else
+    existing='{"version":2,"tries":0,"terminals":[],"machines":{},"baseline":{"machines":{}}}'
+  fi
+  merged=$(jq -cn --arg uuid "$uuid_re" --argjson old "$existing" \
+    --argjson additions "$additions" --argjson baseline "$baseline" --argjson manual "$manual" "$entry_rules"'
+    ([$old.terminals[] | select(actionable | not)]
+      + [$additions[] | select(actionable | not)]) as $inert
+    | (reduce ($old.terminals[] | select(actionable)) as $entry ({};
+        .[$entry | identity] = $entry)) as $old_actionable
+    | (reduce ($inert[] | objects | select(.delivery != null or .collision == true)) as $row
+        ({}; .[$row | identity] = true)) as $blocked
+    | (reduce ($additions[] | select(actionable)) as $entry ($old_actionable;
+        ($entry | identity) as $key
+        | if $manual and (has($key) or $blocked[$key]) then . else .[$key] = $entry end)) as $selected
+    | {version: 2, boot: ($old.boot // $baseline.boot // null),
+        machines: ($old.machines // {}), tries: ($old.tries // 0),
+        terminals: ($inert + [$selected[] | if $blocked[identity] then . + {legacy:true, collision:true} else . end]),
+        baseline: {boot: ($baseline.boot // $old.baseline.boot // null),
+          machines: (($old.baseline.machines // {}) * ($baseline.machines // {}))}}
+  ') || return 1
+  write_json "$pending" "$merged"
+}
+
+prepare_pending() {
+  local inventory=$1 current saved local_changed=false observed='{}' changed='[]' core found old additions baseline count updated
+  [[ -f $snap ]] || return 0
+  current=$(boot) || return 1
+  saved=$(jq -r '.boot | tostring' "$snap") || return 1
+  [[ $saved != "$current" ]] && local_changed=true
+
+  for core in ${(f)"$(jq -r '.routes | keys[]' <<< "$inventory")"}; do
+    found=$(probe_core_boot "$inventory" "$core") || { incomplete=true; continue; }
+    observed=$(jq -c --arg core "$core" --arg boot "$found" '. + {($core): $boot}' <<< "$observed") || return 1
+    old=$(jq -r --arg core "$core" '.machines[$core] // empty' "$snap")
+    if [[ -n $old && $old != "$found" ]]; then
+      changed=$(jq -c --arg core "$core" '. + [$core]' <<< "$changed") || return 1
+    fi
+  done
+
+  additions=$(jq -cn --argjson local_changed "$local_changed" --argjson changed "$changed" --slurpfile old "$snap" '[
+    $old[0].terminals[]?
+    | select(type == "object" and .legacy != true and has("machine"))
+    | . as $entry
+    | select(if $entry.machine == null then $local_changed else ($changed | index($entry.machine) != null) end)
+    | . + {tries: 0}
+  ]') || return 1
+  baseline=$(jq -cn --arg boot "$current" --argjson machines "$observed" \
+    '{boot: $boot, machines: $machines}') || return 1
+  count=$(jq -r 'length' <<< "$additions") || return 1
+
+  if (( count )); then
+    # The pending rename must succeed before any changed baseline is advanced.
+    merge_pending "$additions" "$baseline" || return 1
+    advance_pending_baseline || return 1
+  else
+    updated=$(jq -ce --arg boot "$current" --argjson machines "$observed" '
+      .boot = $boot | .machines = (.machines * $machines)' "$snap") || return 1
+    if [[ $updated != "$(jq -c . "$snap")" ]]; then
+      write_json "$snap" "$updated" || return 1
+      command sync >/dev/null 2>&1 || return 1
+    fi
+  fi
+}
+
+tick_unlocked() {
+  local inventory now saved modified
+  hc server status --json >/dev/null 2>&1 || return 2
+
+  inventory=$(machine_inventory) || { inventory='{"aliases":{},"routes":{},"addresses":[]}'; incomplete=true; }
+  ensure_snapshot_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 2
+  ensure_pending_v2 "$(jq -c '.aliases' <<< "$inventory")" || return 2
+  if [[ -f $pending ]]; then advance_pending_baseline || return 2; fi
+  if [[ -f $snap && ! -f $pending && ${prior_failure:-false} != true ]]; then
+    now=$(boot) || return 2
+    saved=$(jq -r '.boot | tostring' "$snap") || return 2
+    modified=$(stat -f %m "$snap" 2>/dev/null) || modified=0
+    [[ $saved == "$now" && $(( $(date +%s) - modified )) -lt 45 ]] && return 0
+  fi
+  prepare_pending "$inventory" || return 2
+
+  if [[ -f $pending ]]; then
+    restore_pending "$inventory" null || return 2
+  fi
+  save_unlocked >/dev/null
+}
+
+# Every controller mutation, including supervisor completion, uses this lock.
+start_controller() {
+  local code
+  ensure_state || return 1
+  acquire_mutation_lock || {
+    code=$?
+    if (( code == 2 )) && [[ $1 == worker ]]; then print busy; fi
+    return "$code"
+  }
+}
+
+run_worker() {
+  local mode=$1 run=$2 prior_failure=false incomplete=false
+  [[ $mode == (save|tick) ]] && valid_core "$run" || return 1
+  start_controller worker || return $?
+  if [[ -f $state/worker.json ]] && ! jq -e '.status == "succeeded"' "$state/worker.json" >/dev/null; then
+    prior_failure=true
+  fi
+  write_json "$state/worker.json" "{\"status\":\"running\",\"run\":\"$run\",\"pid\":$$,\"priorFailure\":$prior_failure}" || return 1
+  print started
+  exec </dev/null >/dev/null 2>&1
+  "${mode}_unlocked" && [[ $incomplete == false ]]
+}
+
+finish_worker() {
+  local run=$1 outcome=$2 observed file=$state/worker.json
+  valid_core "$run" && [[ $outcome == (succeeded|failed|timed_out) ]] || return 1
+  zmodload zsh/datetime || return 1
+  while [[ -f $file ]]; do
+    observed=$(<"$file") || return 1
+    jq -e --arg run "$run" '.status == "running" and .run == $run' <<< "$observed" >/dev/null || return 0
+    if acquire_mutation_lock; then
+      # A newer owner may have published between the read and lock acquisition.
+      [[ $(<"$file") == "$observed" ]] || return 0
+      write_json "$file" "{\"status\":\"$outcome\",\"run\":\"$run\",\"finished\":$EPOCHSECONDS}"
+      return $?
+    else
+      (( $? == 2 )) || return 1
+    fi
+    /bin/sleep 0.1
   done
 }
 
 case "${1:-}" in
-save) save ;;
-restore) restore ${2:-} >/dev/null ;;
-tick)
-  hc server status --json >/dev/null 2>&1 || exit 0
-  # Every Herdr window runs this mod: one tick at a time, and one save a minute between them.
-  find $state/lock -maxdepth 0 -mmin +5 -exec rmdir {} \; 2>/dev/null
-  mkdir $state/lock 2>/dev/null || exit 0
-  trap 'rmdir $state/lock' EXIT
-  now=$(boot)
-  [[ -f $snap && ! -f $pending && $(jq .boot $snap) == $now && $(( $(date +%s) - $(stat -f %m $snap) )) -lt 45 ]] && exit 0
-  [[ -f $snap && ! -f $pending && $(jq .boot $snap) != $now ]] && jq '. + {tries: 0}' $snap > $pending
-  if [[ -f $pending ]]; then
-    tries=$(jq .tries $pending)
-    left=$(restore $pending | jq -s --argjson n $((tries + 1)) '{tries: $n, terminals: .}')
-    # A terminal the core recovers late gets another try; one the user reused stays skipped.
-    if [[ $(jq '.terminals | length' <<<$left) == 0 || $tries -ge 9 ]]; then rm $pending; else echo $left > $pending; exit 0; fi
+remote-scan)
+  scan_here "${2:-}"
+  ;;
+remote-boot)
+  remote_boot "${2:-}"
+  ;;
+remote-restore)
+  remote_restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+  ;;
+schedule)
+  unsetopt BG_NICE
+  [[ ${2:-} == (save|tick) ]] || exit 2
+  ack=$(/usr/bin/perl "$script:h/supervise.pl" "$script" "$2" </dev/null 2>/dev/null &!)
+  [[ $ack == (started|busy) ]] || exit 1
+  print -r -- "$ack"
+  ;;
+worker)
+  run_worker "${2:-}" "${3:-}"
+  ;;
+finish-worker)
+  finish_worker "${2:-}" "${3:-}"
+  ;;
+save)
+  start_controller save || exit 1
+  save_unlocked
+  ;;
+restore)
+  start_controller '' || exit 1
+  inventory=$(machine_inventory) || inventory='{"aliases":{},"routes":{},"addresses":[]}'
+  core_aliases=$(jq -c '.aliases' <<< "$inventory") || exit 1
+  file=${2:-$snap}
+  [[ -f $file ]] || exit 0
+  ensure_snapshot_v2 "$core_aliases" && ensure_pending_v2 "$core_aliases" || exit 1
+  advance_pending_baseline || exit 1
+  if [[ $file == "$pending" ]]; then
+    restore_pending "$inventory" null
+  else
+    selection=$(jq -cse --arg uuid "$uuid_re" "$entry_rules"'
+      select(length == 1) | .[0] | select(type == "object" and .version == 2) | .terminals | arrays | quarantine
+      | map(select(actionable and .machine == null))' "$file") || exit 1
+    [[ $selection != '[]' ]] || exit 0
+    prepare_pending "$inventory" || exit 1
+    merge_pending "$selection" '{"machines":{}}' true || exit 1
+    restore_pending "$inventory" "$selection"
   fi
-  save >/dev/null ;;
-*) sed -n 3,5p $0; exit 2 ;;
+  ;;
+tick)
+  start_controller tick || {
+    (( $? == 2 )) && exit 0
+    exit 1
+  }
+  tick_unlocked || {
+    code=$?
+    # Preserve the interactive tick's historical best-effort discovery behavior.
+    (( code == 2 )) && exit 0
+    exit "$code"
+  }
+  ;;
+*)
+  sed -n '3,7p' "$0"
+  exit 2
+  ;;
 esac

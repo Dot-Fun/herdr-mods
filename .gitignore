@@ -1,4 +1,6 @@
 .DS_Store
+.worktrees/
 herdr.d.ts
 gpui-kit.d.ts
 jsconfig.json
+.worktrees/
